@@ -5,60 +5,53 @@ import numpy as np
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.2 code here
 # ------------------------------------------------------------------------------------------------
-distance_kernel_shared = cp.RawKernel(r'''
+distance_kernel_tiled = cp.RawKernel(r'''
 extern "C" __global__
-void euclidean_distance_shared(const float* __restrict__ A, 
-                               const float* __restrict__ X, 
-                               float* __restrict__ distances, 
-                               int N, int D) {
-    // Allocate shared memory to store X
-    extern __shared__ float shared_memory[];
+void euclidean_distance_tiled(const float* __restrict__ A, 
+                              const float* __restrict__ X, 
+                              float* __restrict__ distances, 
+                              int N, int D, int tile_size) {
+    extern __shared__ float shared_mem[];
 
-    // First portion is for storing the query vector X
-    float* shared_X = shared_memory;  
+    float* shared_X = shared_mem;
+    float* partial_sums = &shared_mem[tile_size];
 
-    // Second portion is for storing partial sums (for warp reduction)
-    float* partial_sums = &shared_memory[D];  
+    int row = blockIdx.x + blockIdx.y * gridDim.x;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
 
-    // Compute thread and block indices
-    int row = blockIdx.x;  // Each block processes one row of A
-    int col = threadIdx.x + threadIdx.y * blockDim.x;  // 2D thread index
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;  // Flattened thread ID
-
-    // Load vector X into shared memory in chunks. Each thread loads a part of X into shared memory
-    for (int j = tid; j < D; j += blockDim.x * blockDim.y) {
-        shared_X[j] = X[j]; 
-    }
-    __syncthreads();  // Ensure all threads have loaded X
-
-    // Out-of-bounds check
     if (row >= N) return;
 
-    // Compute squared Euclidean distance in parallel
-    float sum = 0.0;
-    for (int j = col; j < D; j += blockDim.x * blockDim.y) {
-        float diff = A[row * D + j] - shared_X[j];  
-        sum += diff * diff;
+    float local_sum = 0.0f;
+
+    for (int tile_start = 0; tile_start < D; tile_start += tile_size) {
+        for (int i = tid; i < tile_size && (tile_start + i) < D; i += num_threads) {
+            shared_X[i] = X[tile_start + i];
+        }
+        __syncthreads();
+
+        for (int j = tid; j < tile_size && (tile_start + j) < D; j += num_threads) {
+            float diff = A[row * D + tile_start + j] - shared_X[j];
+            local_sum += diff * diff;
+        }
+        __syncthreads();
     }
 
-    // Store computed sum in shared memory array
-    partial_sums[tid] = sum;
+    partial_sums[tid] = local_sum;
     __syncthreads();
 
-    // Reduce within the block. Sum all the values in partial_sums array so that final sum will be stored in tid=0
-    for (int stride = blockDim.x * blockDim.y / 2; stride > 0; stride /= 2) {
+    for (int stride = num_threads / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             partial_sums[tid] += partial_sums[tid + stride];
         }
         __syncthreads();
     }
 
-    // Store the final sum in distances (i.e. transfer from shared memory to global memory)
     if (tid == 0) {
         distances[row] = partial_sums[0];
     }
 }
-''', 'euclidean_distance_shared')
+''', 'euclidean_distance_tiled')
 
 
 def our_knn_optimised_shared(N, D, A, X, K):
@@ -75,23 +68,43 @@ def our_knn_optimised_shared(N, D, A, X, K):
     Returns:
     - cp.ndarray: (K,) Array containing the indices of the top K nearest vectors in A.
     """
-    distances = cp.empty(N, dtype=cp.float32)
-
-    # Define block and grid sizes
-    block_x = 32 # Threads per row
-    block_y = 2 # Threads per column
-    gridSize = (N, 1)  # Each block handles a row
-    blockSize = (block_x, block_y)  # 2D block
-
-    # Run the shared memory optimized kernel
-    shared_mem_size = (D + block_x * block_y) * np.dtype(cp.float32).itemsize  # Shared memory size for X and block sums. Measured in bytes
-    distance_kernel_shared(gridSize, blockSize, (A, X, distances, N, D), shared_mem=shared_mem_size)
-
-    # Find top-K nearest neighbors
-    top_k_indices = cp.argpartition(distances, K)[:K]
-    sorted_top_k_indices = top_k_indices[cp.argsort(distances[top_k_indices])]
-
-    return sorted_top_k_indices
+    gpu_batch_num = 8
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+    # Transfer query vector X to GPU
+    X = cp.asarray(X, dtype=cp.float32)
+    # Initialise an empty array to store the distance between the query vector and each vector in the collection
+    final_distances = cp.empty(N, dtype=cp.float32)
+    # Create streams for asynchronous execution
+    stream1 = cp.cuda.Stream(non_blocking=True)
+    stream2 = cp.cuda.Stream(non_blocking=True)
+    
+    # Set the block size for the kernel
+    blockSize = 256
+    tile_size = 10240 # Size of tile of X to be loaded into shared memory
+    
+    for start, end in gpu_batches:
+        with stream1:
+            # Transfer the batch of vectors to the GPU
+            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
+            
+        with stream2:
+            # Wait for transfer to finish before computing distances
+            stream2.wait_event(stream1.record())
+            # Define the number of blocks. Each block processes one row of A
+            gridSize = end - start
+            # Allocate shared memory for the kernel.
+            shared_mem_size = (tile_size + blockSize) * np.dtype(cp.float32).itemsize  # Shared memory size for X (D) and block sums (blocksize). Measured in bytes
+            distance_kernel_tiled((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D, tile_size), shared_mem=shared_mem_size)
+            
+    # Synchronise to ensure all GPU computations are finished
+    cp.cuda.Stream.null.synchronize()
+    # Get indices of the K smallest distances
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    # Sort the top K indices based on actual distances
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    # Transfer the sorted indices back to CPU
+    return cp.asnumpy(sorted_top_k_indices)
 
 
 distance_kernel = cp.RawKernel(r'''
@@ -100,6 +113,7 @@ void euclidean_distance(const float* A, const float* X, float* distances, int N,
     int row = blockIdx.x * blockDim.x + threadIdx.x;  // Each thread processes a row (vector)
     if (row >= N) return;
 
+    // Each thread loops over one vector in A and computes the squared Euclidean distance
     float sum = 0.0;
     for (int j = 0; j < D; j++) {
         float diff = A[row * D + j] - X[j];
@@ -123,25 +137,89 @@ def our_knn_optimised(N, D, A, X, K):
     Returns:
     - cp.ndarray: (K,) Array containing the indices of the top K nearest vectors in A.
     """
+    gpu_batch_num = 8
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+    
+    stream1 = cp.cuda.Stream(non_blocking=True)
+    stream2 = cp.cuda.Stream(non_blocking=True)
+    
+    # Transfer query vector X to GPU
+    X = cp.asarray(X, dtype=cp.float32)
+    
     # Initialise an empty array to store the distance between the query vector and each vector in the collection
-    distances = cp.empty(N, dtype=cp.float32)
+    final_distances = cp.empty(N, dtype=cp.float32)
+    
 
     # Launch CUDA kernel with optimised grid and block size
     blockSize = 256
-    gridSize = (N + blockSize - 1) // blockSize
+    
+    # Transfer the query vector to the GPU
+    X = cp.asarray(X, dtype=cp.float32)
+    
+    for start, end in gpu_batches:
+        with stream1:
+            # Transfer the batch of vectors to the GPU
+            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
+            
+        with stream2:
+            # Wait for transfer to finish before computing distances
+            stream2.wait_event(stream1.record())
+            # Compute the Euclidean distance between target vector and all other vectors
+            gridSize = (end - start + blockSize - 1) // blockSize
+            distance_kernel((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D))
+    
+    # Synchronise to ensure all GPU computations are finished
+    cp.cuda.Stream.null.synchronize()
+    # Get indices of the K smallest distances
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    # Sort the top K indices based on actual distances
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    # Transfer the sorted indices back to CPU
+    return cp.asnumpy(sorted_top_k_indices)
 
-    # This kernal will modify distances (CuPy array) in place
-    distance_kernel((gridSize,), (blockSize,), (A, X, distances, N, D))
+def our_knn_stream(N, D, A, X, K):
+    gpu_batch_num = 8
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+    
+    stream1 = cp.cuda.Stream(non_blocking=True)
+    stream2 = cp.cuda.Stream(non_blocking=True)
+    
+    # Transfer query vector X to GPU
+    X = cp.asarray(X, dtype=cp.float32)
+    
+    final_distances = cp.empty(N, dtype=cp.float32)
+    
+    for start, end in gpu_batches:
+        with stream1:
+            #Transfer the batch of vectors to GPU
+            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
+            
+        with stream2:
+            # Need to wait for the transfer to finish before computing distances
+            stream2.wait_event(stream1.record())
+            #Compute the Euclidean distance between target vector and all other vectors
+            distances = cp.sum((A_batch_gpu - X) ** 2, axis = 1)
+            # Store the distances in the final array
+            final_distances[start:end] = distances
 
-    # Find top-K nearest neighbors
-    top_k_indices = cp.argpartition(distances, K)[:K]
-    sorted_top_k_indices = top_k_indices[cp.argsort(distances[top_k_indices])]
+    cp.cuda.Stream.null.synchronize()
+    # Get indices of the K smallest distances
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    # Sort the top K indices based on actual distances
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    # Transfer the sorted indices back to CPU
+    return cp.asnumpy(sorted_top_k_indices)
 
-    return sorted_top_k_indices
 
-def our_knn(N, D, A, X, K):
+def our_knn_baseline(N, D, A, X, K):
+    # Transfer A and X to the GPU
+    A_gpu = cp.asarray(A)
+    X_gpu = cp.asarray(X)
     # Compute the Euclidean distance between target vector and all other vectors
-    distances = cp.sum((A - X) ** 2, axis = 1)
+    # This creates a temporary array of shape (N, D), using the same memory in the GPU as A_gpu
+    distances = cp.sum((A_gpu - X_gpu) ** 2, axis = 1)
 
     # Get indices of the K smallest distances
     top_k_indices = cp.argpartition(distances, K)[:K]
@@ -150,37 +228,35 @@ def our_knn(N, D, A, X, K):
     sorted_top_k_indices = top_k_indices[cp.argsort(distances[top_k_indices])]
 
     # Return the indices of the top K closest vectors
-    return sorted_top_k_indices
+    return cp.asnumpy(sorted_top_k_indices)   
 
 # ------------------------------------------------------------------------------------------------
 # Test your code here
 # ------------------------------------------------------------------------------------------------
-
+    
 def test_knn_function(func, N, D, A, X, K, repeat):
+    # Warm up, first run seems to be a lot longer than the subsequent runs
+    result = func(N, D, A, X, K)
     start = time.time()
     for _ in range(repeat):
+        # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         result = func(N, D, A, X, K)
     # Synchronise to ensure all GPU computations are finished before measuring end time
     cp.cuda.Stream.null.synchronize()
     end = time.time()
     avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
     print(f"CuPy {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
+    
 
 if __name__ == "__main__":
-    cp.random.seed(42)
-    N = 400000
-    D = 512
-    A = cp.random.randn(N, D).astype(cp.float32)
-    X = cp.random.randn(D).astype(cp.float32)
+    np.random.seed(42)
+    N = 15000
+    D = 32768
+    A = np.random.randn(N, D).astype(np.float32)
+    X = np.random.randn(D).astype(np.float32)
     K = 10
-    repeat = 100
+    repeat = 1
 
-    # Print device capabilities
-    device = cp.cuda.Device()
-    print(f"Max threads per block: {device.attributes['MaxThreadsPerBlock']}")
-    print(f"Max threads per multiprocessor: {device.attributes['MaxThreadsPerMultiProcessor']}")
-    print(f"Max grid dimensions: {device.attributes['MaxGridDimX']}, {device.attributes['MaxGridDimY']}, {device.attributes['MaxGridDimZ']}")
-
-    knn_functions = [our_knn, our_knn_optimised, our_knn_optimised_shared]
+    knn_functions = [our_knn_baseline, our_knn_optimised, our_knn_optimised_shared]
     for func in knn_functions:
         test_knn_function(func, N, D, A, X, K, repeat)

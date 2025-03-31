@@ -5,12 +5,63 @@ import numpy as np
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.2 code here
 # ------------------------------------------------------------------------------------------------
+distance_kernel_shared_no_tile = cp.RawKernel(r'''
+extern "C" __global__
+void euclidean_distance_shared(const float* __restrict__ A, 
+                               const float* __restrict__ X, 
+                               float* __restrict__ distances, 
+                               int N, int D) {
+    // Allocate shared memory for X and partial sums
+    extern __shared__ float shared_memory[];
+
+    float* shared_X = shared_memory;            // First D floats for X
+    float* partial_sums = &shared_memory[D];    // Next blockDim.x floats for partial sums
+
+    int row = blockIdx.x;          // Each block processes one row of A
+    int tid = threadIdx.x;         // Each thread has a unique 1D index
+    int num_threads = blockDim.x;  // Total threads per block
+
+    if (row >= N) return;
+
+    // Load X into shared memory (striped load)
+    for (int j = tid; j < D; j += num_threads) {
+        shared_X[j] = X[j];
+    }
+    __syncthreads();
+
+    // Compute partial sum of squared differences
+    float local_sum = 0.0f;
+    for (int j = tid; j < D; j += num_threads) {
+        float diff = A[row * D + j] - shared_X[j];
+        local_sum += diff * diff;
+    }
+
+    // Write local sum into shared memory
+    partial_sums[tid] = local_sum;
+    __syncthreads();
+
+    // Block-level reduction
+    for (int stride = num_threads / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial_sums[tid] += partial_sums[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Write final result to global memory
+    if (tid == 0) {
+        distances[row] = partial_sums[0];
+    }
+}
+''', 'euclidean_distance_shared')
+
 distance_kernel_tiled = cp.RawKernel(r'''
 extern "C" __global__
 void euclidean_distance_tiled(const float* __restrict__ A, 
                               const float* __restrict__ X, 
                               float* __restrict__ distances, 
                               int N, int D, int tile_size) {
+    // Allocate shared memory for the tile of X and the partial sums
     extern __shared__ float shared_mem[];
 
     float* shared_X = shared_mem;
@@ -22,24 +73,32 @@ void euclidean_distance_tiled(const float* __restrict__ A,
 
     if (row >= N) return;
 
+    // Threads accumulator for partial sum of squared differences
     float local_sum = 0.0f;
 
+    // Iterate over the tiles of X
     for (int tile_start = 0; tile_start < D; tile_start += tile_size) {
+        
+        // Each thread load a portion of the tile of X into shared memory
         for (int i = tid; i < tile_size && (tile_start + i) < D; i += num_threads) {
             shared_X[i] = X[tile_start + i];
         }
         __syncthreads();
 
+        // Each thread computes its chunk of the squared difference between A[row] and X
         for (int j = tid; j < tile_size && (tile_start + j) < D; j += num_threads) {
             float diff = A[row * D + tile_start + j] - shared_X[j];
+            // Update the threads local sum of the squared differences
             local_sum += diff * diff;
         }
         __syncthreads();
     }
 
+    // Store the threads local sum in shared memory
     partial_sums[tid] = local_sum;
     __syncthreads();
 
+    // Perform reduction in shared memory to compute the final sum for this row
     for (int stride = num_threads / 2; stride > 0; stride /= 2) {
         if (tid < stride) {
             partial_sums[tid] += partial_sums[tid + stride];
@@ -47,6 +106,8 @@ void euclidean_distance_tiled(const float* __restrict__ A,
         __syncthreads();
     }
 
+    // Store the final result in the global memory
+    // Only one thread in the block writes the result
     if (tid == 0) {
         distances[row] = partial_sums[0];
     }
@@ -68,7 +129,7 @@ def our_knn_optimised_shared(N, D, A, X, K):
     Returns:
     - cp.ndarray: (K,) Array containing the indices of the top K nearest vectors in A.
     """
-    gpu_batch_num = 8
+    gpu_batch_num = 7
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
     # Transfer query vector X to GPU
@@ -81,7 +142,9 @@ def our_knn_optimised_shared(N, D, A, X, K):
     
     # Set the block size for the kernel
     blockSize = 256
-    tile_size = 10240 # Size of tile of X to be loaded into shared memory
+    # Bigger tile_size = more shared memory requirement = less blocks run concurrently
+    # Number of elements of X
+    tile_size = 4096 # Size of tile of X to be loaded into shared memory
     
     for start, end in gpu_batches:
         with stream1:
@@ -93,9 +156,17 @@ def our_knn_optimised_shared(N, D, A, X, K):
             stream2.wait_event(stream1.record())
             # Define the number of blocks. Each block processes one row of A
             gridSize = end - start
-            # Allocate shared memory for the kernel.
-            shared_mem_size = (tile_size + blockSize) * np.dtype(cp.float32).itemsize  # Shared memory size for X (D) and block sums (blocksize). Measured in bytes
-            distance_kernel_tiled((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D, tile_size), shared_mem=shared_mem_size)
+            # Check to see if we need tiling or not
+            # 4096 elements = 16,384 bytes taken up of the shared memory
+            # Leaves enough room to run 2-3 blocks per SM, ideal for concurrency
+            if D < 4069:
+                # Allocate shared memory for the kernel
+                shared_mem_size = (D + blockSize) * cp.dtype(cp.float32).itemsize
+                distance_kernel_shared_no_tile((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D), shared_mem=shared_mem_size)
+            else:
+                # Allocate shared memory for the kernel.
+                shared_mem_size = (tile_size + blockSize) * np.dtype(cp.float32).itemsize  # Shared memory size for X (D) and block sums (blocksize). Measured in bytes
+                distance_kernel_tiled((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D, tile_size), shared_mem=shared_mem_size)
             
     # Synchronise to ensure all GPU computations are finished
     cp.cuda.Stream.null.synchronize()
@@ -137,7 +208,7 @@ def our_knn_optimised(N, D, A, X, K):
     Returns:
     - cp.ndarray: (K,) Array containing the indices of the top K nearest vectors in A.
     """
-    gpu_batch_num = 8
+    gpu_batch_num = 7
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
     
@@ -179,7 +250,7 @@ def our_knn_optimised(N, D, A, X, K):
     return cp.asnumpy(sorted_top_k_indices)
 
 def our_knn_stream(N, D, A, X, K):
-    gpu_batch_num = 8
+    gpu_batch_num = 7
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
     
@@ -250,13 +321,13 @@ def test_knn_function(func, N, D, A, X, K, repeat):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    N = 15000
-    D = 32768
+    N = 2000000
+    D = 128
     A = np.random.randn(N, D).astype(np.float32)
     X = np.random.randn(D).astype(np.float32)
     K = 10
-    repeat = 1
+    repeat = 100
 
-    knn_functions = [our_knn_baseline, our_knn_optimised, our_knn_optimised_shared]
+    knn_functions = [our_knn_baseline, our_knn_stream, our_knn_optimised, our_knn_optimised_shared]
     for func in knn_functions:
         test_knn_function(func, N, D, A, X, K, repeat)

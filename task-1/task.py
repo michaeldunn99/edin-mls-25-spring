@@ -493,7 +493,112 @@ def our_knn_L1_CUPY(N, D, A, X, K):
 #     pass
 
 def our_kmeans(N, D, A, K):
-    pass
+    max_iters = 20
+    tol = 1e-4
+    # Create the gpu batches
+    gpu_batch_num = 10
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    A = np.asarray(A, dtype=np.float32)
+    cluster_assignments = np.empty(N, dtype=np.int32)
+
+    # Initialize GPU centroids
+    np.random.seed(42)
+    indices = np.random.choice(N, K, replace=False)
+    centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
+
+    stream1 = cp.cuda.Stream(non_blocking=True)
+    stream2 = cp.cuda.Stream(non_blocking=True)
+    event = cp.cuda.Event()
+
+    for _ in range(max_iters):
+        new_centroids = cp.zeros((K, D), dtype=cp.float32)
+        counts = cp.zeros(K, dtype=cp.int32)
+
+        for start, end in gpu_batches:
+            with stream1:
+                A_batch_host = A[start:end]
+                A_batch_gpu = cp.asarray(A_batch_host, dtype=cp.float32)
+                stream1.record(event)
+
+            with stream2:
+                stream2.wait_event(event)
+
+                # Compute distances and assignments
+                A_norm = cp.sum(A_batch_gpu ** 2, axis=1).reshape(-1, 1)
+                C_norm = cp.sum(centroids_gpu ** 2, axis=1).reshape(1, -1)
+                distances = A_norm + C_norm - 2 * A_batch_gpu @ centroids_gpu.T
+
+                cluster_ids_batch = cp.argmin(distances, axis=1)
+                cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
+
+                # Pull batch to CPU for CPU-side reduction
+                ids_np = cluster_assignments[start:end]
+                A_np = A_batch_host  # already on CPU
+
+                for k in range(K):
+                    members = A_np[ids_np == k]
+                    if len(members) > 0:
+                        new_centroids[k] += cp.asarray(members.sum(axis=0))
+                        counts[k] += len(members)
+
+        # Finalize centroid update
+        counts = cp.maximum(counts, 1)
+        updated_centroids = new_centroids / counts[:, None]
+
+        shift = cp.linalg.norm(updated_centroids - centroids_gpu)
+        if shift < tol:
+            break
+        centroids_gpu = updated_centroids
+
+    return cp.asarray(cluster_assignments)
+
+import numpy as np
+
+def simple_kmeans(N, D, A, K, max_iters=20, tol=1e-4):
+    """
+    Simple CPU-based KMeans using NumPy for testing.
+    
+    Parameters:
+    - N (int): Number of points
+    - D (int): Dimension of each point
+    - A (np.ndarray): Data of shape (N, D)
+    - K (int): Number of clusters
+    - max_iters (int): Maximum number of iterations
+    - tol (float): Convergence threshold
+    
+    Returns:
+    - cluster_assignments (np.ndarray): Array of shape (N,) with cluster indices
+    """
+    A = np.asarray(A, dtype=np.float32)
+    
+    # Randomly initialize K centroids
+    np.random.seed(42) 
+    indices = np.random.choice(N, K, replace=False)
+    centroids = A[indices]
+
+    for _ in range(max_iters):
+        # Compute distances from all points to all centroids (N, K)
+        distances = np.linalg.norm(A[:, None, :] - centroids[None, :, :], axis=2)
+        cluster_assignments = np.argmin(distances, axis=1)
+
+        # Compute new centroids
+        new_centroids = np.zeros((K, D), dtype=np.float32)
+        for k in range(K):
+            members = A[cluster_assignments == k]
+            if len(members) > 0:
+                new_centroids[k] = members.mean(axis=0)
+
+        # Check convergence
+        shift = np.linalg.norm(new_centroids - centroids)
+        if shift < tol:
+            break
+
+        centroids = new_centroids
+
+    return cluster_assignments
+
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.2 code here
@@ -549,6 +654,6 @@ if __name__ == "__main__":
     K = 10
     repeat = 100
 
-    knn_functions = [our_knn_L2_CUDA, our_knn_L2_CUPY, our_knn_cosine_CUPY, our_knn_dot_CUPY, our_knn_L1_CUPY]
+    knn_functions = []
     for func in knn_functions:
         test_knn(func, N, D, A, X, K, repeat)

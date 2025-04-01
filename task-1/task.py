@@ -496,7 +496,7 @@ def our_kmeans_L2(N, D, A, K):
     max_iters = 20
     tol = 1e-4
     # Create the gpu batches
-    gpu_batch_num = 10
+    gpu_batch_num = 20
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
@@ -566,6 +566,69 @@ def our_kmeans_L2(N, D, A, K):
 
     return cp.asarray(cluster_assignments)
 
+def our_kmeans_cosine(N, D, A, K):
+    max_iters = 20
+    tol = 1e-4
+    gpu_batch_num = 30
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    A = np.asarray(A, dtype=np.float32)
+    cluster_assignments = np.empty(N, dtype=np.int32)
+
+    # Initialize centroids and normalize them to unit vectors
+    indices = np.random.choice(N, K, replace=False)
+    centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
+    centroids_gpu /= cp.linalg.norm(centroids_gpu, axis=1, keepdims=True) + 1e-8
+
+    stream1 = cp.cuda.Stream(non_blocking=True)
+    stream2 = cp.cuda.Stream(non_blocking=True)
+    event = cp.cuda.Event()
+
+    for _ in range(max_iters):
+        new_centroids = cp.zeros((K, D), dtype=cp.float32)
+        counts = cp.zeros(K, dtype=cp.int32)
+
+        for start, end in gpu_batches:
+            with stream1:
+                A_batch_host = A[start:end]
+                A_batch_gpu = cp.asarray(A_batch_host, dtype=cp.float32)
+                stream1.record(event)
+
+            with stream2:
+                stream2.wait_event(event)
+
+                # Normalize batch to unit vectors for cosine distance
+                norms = cp.linalg.norm(A_batch_gpu, axis=1, keepdims=True) + 1e-8
+                A_normalized = A_batch_gpu / norms
+
+                # Cosine similarity = dot product of normalized vectors
+                similarity = A_normalized @ centroids_gpu.T
+                cosine_distance = 1.0 - similarity  # higher sim → lower distance
+
+                cluster_ids_batch = cp.argmin(cosine_distance, axis=1)
+                cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
+
+                ids_np = cluster_assignments[start:end]
+                A_np = A_batch_host  # already on CPU
+
+                for k in range(K):
+                    members = A_np[ids_np == k]
+                    if len(members) > 0:
+                        new_centroids[k] += cp.asarray(members.sum(axis=0))
+                        counts[k] += len(members)
+
+        counts = cp.maximum(counts, 1)
+        updated_centroids = new_centroids / counts[:, None]
+        updated_centroids /= cp.linalg.norm(updated_centroids, axis=1, keepdims=True) + 1e-8  # normalize for next round
+
+        shift = cp.linalg.norm(updated_centroids - centroids_gpu)
+        if shift < tol:
+            break
+        centroids_gpu = updated_centroids
+
+    return cp.asarray(cluster_assignments)
+
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.2 code here
@@ -621,15 +684,15 @@ def recall_rate(list1, list2):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    N = 15000
-    D = 32768
+    N = 480000
+    D = 1024
     A = np.random.randn(N, D).astype(np.float32)
     X = np.random.randn(D).astype(np.float32)
     K = 10
     repeat = 1
 
     knn_functions = []
-    kmeans_functions = [our_kmeans_L2]
+    kmeans_functions = [our_kmeans_L2, our_kmeans_cosine]
     if knn_functions:
         for func in knn_functions:
             test_knn(func, N, D, A, X, K, repeat)

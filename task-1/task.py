@@ -492,10 +492,9 @@ def our_knn_L1_CUPY(N, D, A, X, K):
 # def distance_kernel(X, Y, D):
 #     pass
 
-def our_kmeans_L2(N, D, A, K):
+def our_kmeans_L2(N, D, A, K, return_loss=True):
     max_iters = 20
     tol = 1e-4
-    # Create the gpu batches
     gpu_batch_num = 20
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
@@ -504,6 +503,7 @@ def our_kmeans_L2(N, D, A, K):
     cluster_assignments = np.empty(N, dtype=np.int32)
 
     # Initialise GPU centroids
+    np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
 
@@ -512,61 +512,57 @@ def our_kmeans_L2(N, D, A, K):
     event = cp.cuda.Event()
 
     for _ in range(max_iters):
-        # Initialise cetroids
         new_centroids = cp.zeros((K, D), dtype=cp.float32)
-        # Initialise counts of vectors in a cluster
         counts = cp.zeros(K, dtype=cp.int32)
 
         for start, end in gpu_batches:
             with stream1:
                 A_batch_host = A[start:end]
-                # Move batch of A to gpu
                 A_batch_gpu = cp.asarray(A_batch_host, dtype=cp.float32)
                 stream1.record(event)
 
             with stream2:
                 stream2.wait_event(event)
 
-                # Compute L2 distances between every vector and every centroid
                 A_norm = cp.sum(A_batch_gpu ** 2, axis=1).reshape(-1, 1)
                 C_norm = cp.sum(centroids_gpu ** 2, axis=1).reshape(1, -1)
-                # distances is a matrix of shape (batch_size, K)
                 distances = A_norm + C_norm - 2 * A_batch_gpu @ centroids_gpu.T
 
-                # Create array to store assignment of each vector to the closest centroid
                 cluster_ids_batch = cp.argmin(distances, axis=1)
-                # Convert the results back to CPU
                 cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
 
-                # Pull batch to CPU for CPU-side reduction
                 ids_np = cluster_assignments[start:end]
-                A_np = A_batch_host  # already on CPU
+                A_np = A_batch_host
 
-                # For each cluster
                 for k in range(K):
-                    # Find all the vectors assigned to this cluster
                     members = A_np[ids_np == k]
                     if len(members) > 0:
-                        # Compute the sum of all the vectors in this cluster for this batch and 
-                        # add it to the GPU centroid accumulator
                         new_centroids[k] += cp.asarray(members.sum(axis=0))
-                        # Increment the counts of the vectors in this cluster
                         counts[k] += len(members)
 
-        # Finalise centroid update
         counts = cp.maximum(counts, 1)
-        # Compute the mean of the centroids by dividing the accumulated sum of all vectors in the cluster by the counts
         updated_centroids = new_centroids / counts[:, None]
 
-        # Compute how much the centroids have moved
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
         if shift < tol:
             break
         centroids_gpu = updated_centroids
 
+    # Optionally compute loss for elbow plot
+    if return_loss:
+        total_loss = 0.0
+        centroids_cpu = cp.asnumpy(centroids_gpu)
+        for k in range(K):
+            members = A[cluster_assignments == k]
+            if len(members) > 0:
+                diff = members - centroids_cpu[k]
+                total_loss += np.sum(diff ** 2)
+        return cp.asarray(cluster_assignments), total_loss
+
     return cp.asarray(cluster_assignments)
 
-def our_kmeans_cosine(N, D, A, K):
+
+def our_kmeans_cosine(N, D, A, K, return_loss=False):
     max_iters = 20
     tol = 1e-4
     gpu_batch_num = 30
@@ -576,7 +572,7 @@ def our_kmeans_cosine(N, D, A, K):
     A = np.asarray(A, dtype=np.float32)
     cluster_assignments = np.empty(N, dtype=np.int32)
 
-    # Initialize centroids and normalize them to unit vectors
+    np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
     centroids_gpu /= cp.linalg.norm(centroids_gpu, axis=1, keepdims=True) + 1e-8
@@ -598,19 +594,17 @@ def our_kmeans_cosine(N, D, A, K):
             with stream2:
                 stream2.wait_event(event)
 
-                # Normalize batch to unit vectors for cosine distance
                 norms = cp.linalg.norm(A_batch_gpu, axis=1, keepdims=True) + 1e-8
                 A_normalized = A_batch_gpu / norms
 
-                # Cosine similarity = dot product of normalized vectors
                 similarity = A_normalized @ centroids_gpu.T
-                cosine_distance = 1.0 - similarity  # higher sim → lower distance
+                cosine_distance = 1.0 - similarity
 
                 cluster_ids_batch = cp.argmin(cosine_distance, axis=1)
                 cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
 
                 ids_np = cluster_assignments[start:end]
-                A_np = A_batch_host  # already on CPU
+                A_np = A_batch_host
 
                 for k in range(K):
                     members = A_np[ids_np == k]
@@ -620,14 +614,27 @@ def our_kmeans_cosine(N, D, A, K):
 
         counts = cp.maximum(counts, 1)
         updated_centroids = new_centroids / counts[:, None]
-        updated_centroids /= cp.linalg.norm(updated_centroids, axis=1, keepdims=True) + 1e-8  # normalize for next round
+        updated_centroids /= cp.linalg.norm(updated_centroids, axis=1, keepdims=True) + 1e-8
 
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
         if shift < tol:
             break
         centroids_gpu = updated_centroids
 
+    if return_loss:
+        total_loss = 0.0
+        centroids_cpu = cp.asnumpy(centroids_gpu)
+        centroids_cpu /= np.linalg.norm(centroids_cpu, axis=1, keepdims=True) + 1e-8
+        for k in range(K):
+            members = A[cluster_assignments == k]
+            if len(members) > 0:
+                members_normed = members / (np.linalg.norm(members, axis=1, keepdims=True) + 1e-8)
+                sims = members_normed @ centroids_cpu[k]
+                total_loss += np.sum(1.0 - sims)
+        return cp.asarray(cluster_assignments), total_loss
+
     return cp.asarray(cluster_assignments)
+
 
 
 # ------------------------------------------------------------------------------------------------

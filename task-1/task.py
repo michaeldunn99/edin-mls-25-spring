@@ -45,7 +45,7 @@ def distance_l2_CUPY(X, Y):
     Returns:
     cupy.ndarray: Squared Euclidean distance between X and Y.
     """
-    return cp.sum((X - Y) ** 2)
+    return cp.linalg.norm(X - Y)
 
 def distance_dot_CUPY(X, Y):
     """
@@ -167,7 +167,7 @@ void euclidean_distance(const float* A, const float* X, float* distances, int N,
         float diff = A[row * D + j] - X[j];
         sum += diff * diff; //Square the differences
     }
-    distances[row] = sum;  // Store squared Euclidean distance
+    distances[row] = sqrtf(sum);  // Store L2 Euclidean distance
 }
 ''', 'euclidean_distance')
 
@@ -216,7 +216,7 @@ void euclidean_distance_shared(const float* __restrict__ A,
 
     // Write final result to global memory
     if (tid == 0) {
-        distances[row] = partial_sums[0];
+        distances[row] = sqrtf(partial_sums[0]);
     }
 }
 ''', 'euclidean_distance_shared')
@@ -275,7 +275,7 @@ void euclidean_distance_tiled(const float* __restrict__ A,
     // Store the final result in the global memory
     // Only one thread in the block writes the result
     if (tid == 0) {
-        distances[row] = partial_sums[0];
+        distances[row] = sqrtf(partial_sums[0]);
     }
 }
 ''', 'euclidean_distance_tiled')
@@ -285,45 +285,56 @@ def our_knn_L2_CUDA(N, D, A, X, K):
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
-    X = cp.asarray(X, dtype=cp.float32)
+    # Move query vector to GPU once
+    X_gpu = cp.asarray(X, dtype=cp.float32)
     final_distances = cp.empty(N, dtype=cp.float32)
 
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-
+    # Launch config
     blockSize = 256
     tile_size = 4096  # for shared memory tiling
 
-    for start, end in gpu_batches:
-        with stream1:
-            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
+    # Pre-create streams and GPU buffers
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
 
-        with stream2:
-            stream2.wait_event(stream1.record())
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
 
-            # If large N, use shared memory
-            if N > 1000000:
-                gridSize = end - start
-                # If D is small, use shared memory without tiling
+        with stream:
+            # Async copy of A[start:end] to GPU
+            A_device[i][:batch_size].set(A[start:end])
+
+            gridSize = (batch_size + blockSize - 1) // blockSize
+
+            if N > 1_000_000:
                 if D < 4096:
                     shared_mem_size = (D + blockSize) * cp.dtype(cp.float32).itemsize
                     distance_kernel_shared_no_tile(
-                        (gridSize,), (blockSize,),
-                        (A_batch_gpu, X, final_distances[start:end], end - start, D),
+                        (batch_size,), (blockSize,),
+                        (A_device[i][:batch_size], X_gpu, final_distances[start:end], batch_size, D),
+                        stream=stream,
                         shared_mem=shared_mem_size
                     )
                 else:
                     shared_mem_size = (tile_size + blockSize) * cp.dtype(cp.float32).itemsize
                     distance_kernel_tiled(
-                        (gridSize,), (blockSize,),
-                        (A_batch_gpu, X, final_distances[start:end], end - start, D, tile_size),
+                        (batch_size,), (blockSize,),
+                        (A_device[i][:batch_size], X_gpu, final_distances[start:end], batch_size, D, tile_size),
+                        stream=stream,
                         shared_mem=shared_mem_size
                     )
             else:
-                gridSize = (end - start + blockSize - 1) // blockSize
-                distance_kernel((gridSize,), (blockSize,), (A_batch_gpu, X, final_distances[start:end], end - start, D))
+                distance_kernel(
+                    (gridSize,), (blockSize,),
+                    (A_device[i][:batch_size], X_gpu, final_distances[start:end], batch_size, D),
+                    stream=stream
+                )
+
+    # Wait for all streams to complete
     cp.cuda.Stream.null.synchronize()
 
+    # Run Top-K reduction kernel
     gridSize = min((N + blockSize - 1) // blockSize, 128)
     shared_mem_topk = blockSize * K * (cp.dtype(cp.float32).itemsize + cp.dtype(cp.int32).itemsize)
 
@@ -336,6 +347,7 @@ def our_knn_L2_CUDA(N, D, A, X, K):
         shared_mem=shared_mem_topk
     )
 
+    # Final sort on host
     final_idx = cp.argsort(candidates)[:K]
     sorted_top_k_indices = candidate_indices[final_idx]
 
@@ -345,74 +357,85 @@ def our_knn_L2_CUPY(N, D, A, X, K):
     gpu_batch_num = 10
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
-    
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    
-    # Transfer query vector X to GPU
-    X = cp.asarray(X, dtype=cp.float32)
-    
-    final_distances = cp.empty(N, dtype=cp.float32)
-    
-    for start, end in gpu_batches:
-        with stream1:
-            #Transfer the batch of vectors to GPU
-            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
-            
-        with stream2:
-            # Need to wait for the transfer to finish before computing distances
-            stream2.wait_event(stream1.record())
-            #Compute the Euclidean distance between target vector and all other vectors
-            distances = cp.sum((A_batch_gpu - X) ** 2, axis = 1)
-            # Store the distances in the final array
-            final_distances[start:end] = distances
 
+    # Create multiple CUDA streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+
+    # Preallocate device memory for batches
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
+
+    # Move query vector X to GPU once (shared across all streams)
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+
+    # Preallocate final distance array
+    final_distances = cp.empty(N, dtype=cp.float32)
+
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
+        with stream:
+            # Async copy: Host to preallocated device buffer
+            A_device[i][:batch_size].set(A[start:end])
+            # Compute L2 distance: norm(A[i] - X)
+            D_device[i][:batch_size] = cp.linalg.norm(A_device[i][:batch_size] - X_gpu, axis=1)
+            # Store result in final array
+            final_distances[start:end] = D_device[i][:batch_size]
+
+    # Wait for all streams to finish
     cp.cuda.Stream.null.synchronize()
-    # Get indices of the K smallest distances
+
+    # Top-K selection on GPU
     top_k_indices = cp.argpartition(final_distances, K)[:K]
-    # Sort the top K indices based on actual distances
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
-    # Transfer the sorted indices back to CPU
-    cp.get_default_memory_pool().free_all_blocks()
+
     return cp.asnumpy(sorted_top_k_indices)
+
 
 def our_knn_cosine_CUPY(N, D, A, X, K):
     gpu_batch_num = 10
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
-    
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    
-    # Transfer and normalize query vector X to unit length
-    X = cp.asarray(X, dtype=cp.float32)
-    X /= cp.linalg.norm(X) + 1e-8
 
+    # Create streams and preallocate GPU buffers
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
+
+    # Transfer and normalize query vector
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+    X_gpu /= cp.linalg.norm(X_gpu) + 1e-8
+
+    # Output distance array
     final_distances = cp.empty(N, dtype=cp.float32)
-    
-    for start, end in gpu_batches:
-        with stream1:
-            A_batch_gpu = cp.asarray(A[start:end], dtype=cp.float32)
-        
-        with stream2:
-            stream2.wait_event(stream1.record())
 
-            # Normalize A vectors in the batch to unit length
-            norms = cp.linalg.norm(A_batch_gpu, axis=1, keepdims=True) + 1e-8
-            A_normalized = A_batch_gpu / norms
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
 
-            # Compute cosine similarity and then cosine distance
-            sim = A_normalized @ X
-            distances = 1.0 - sim
+        with stream:
+            # Async copy from host to device
+            A_device[i][:batch_size].set(A[start:end])
 
-            final_distances[start:end] = distances
+            # Normalize A vectors
+            norms = cp.linalg.norm(A_device[i][:batch_size], axis=1, keepdims=True) + 1e-8
+            A_normalized = A_device[i][:batch_size] / norms
 
+            # Compute cosine similarity → distance
+            similarity = A_normalized @ X_gpu
+            D_device[i][:batch_size] = 1.0 - similarity
+
+            # Store result in final distance array
+            final_distances[start:end] = D_device[i][:batch_size]
+
+    # Wait for all streams to complete
     cp.cuda.Stream.null.synchronize()
-    cp.get_default_memory_pool().free_all_blocks()
 
+
+    # Top-K retrieval
     top_k_indices = cp.argpartition(final_distances, K)[:K]
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
-    
+
     return cp.asnumpy(sorted_top_k_indices)
 
 def our_knn_dot_CUPY(N, D, A, X, K):
@@ -420,32 +443,35 @@ def our_knn_dot_CUPY(N, D, A, X, K):
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    event = cp.cuda.Event()
+    # Allocate CUDA streams and GPU buffers
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
 
-    # Transfer query vector X to GPU (no normalization needed for dot product)
+    # Transfer query vector X to GPU (dot product doesn't require normalization)
     X_gpu = cp.asarray(X, dtype=cp.float32)
 
     final_distances = cp.empty(N, dtype=cp.float32)
 
-    for start, end in gpu_batches:
-        with stream1:
-            A_batch_host = np.asarray(A[start:end], dtype=np.float32)
-            A_batch_gpu = cp.asarray(A_batch_host)
-            stream1.record(event)
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
 
-        with stream2:
-            stream2.wait_event(event)
+        with stream:
+            # Async copy of batch to preallocated GPU buffer
+            A_device[i][:batch_size].set(A[start:end])
 
-            # Compute dot product (similarity), use negative for distance
-            dot_scores = cp.matmul(A_batch_gpu, X_gpu)
-            distances = -dot_scores  # negative since KNN ranks by smallest
+            # Compute dot product (similarity), convert to negative for distance
+            dot_scores = A_device[i][:batch_size] @ X_gpu
+            D_device[i][:batch_size] = -dot_scores  # lower score = more similar
 
-            final_distances[start:end] = distances
+            # Write distances to final output
+            final_distances[start:end] = D_device[i][:batch_size]
 
+    # Wait for all CUDA streams to finish
     cp.cuda.Stream.null.synchronize()
 
+    # Get Top-K indices
     top_k_indices = cp.argpartition(final_distances, K)[:K]
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
 
@@ -456,31 +482,37 @@ def our_knn_L1_CUPY(N, D, A, X, K):
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    event = cp.cuda.Event()
+    # Create multiple non-blocking streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    
+    # Preallocate GPU buffers
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
 
-    # Transfer query vector X to GPU
+    # Copy X to GPU
     X_gpu = cp.asarray(X, dtype=cp.float32)
 
+    # Final output distances
     final_distances = cp.empty(N, dtype=cp.float32)
 
-    for start, end in gpu_batches:
-        with stream1:
-            A_batch_host = np.asarray(A[start:end], dtype=np.float32)
-            A_batch_gpu = cp.asarray(A_batch_host)
-            stream1.record(event)
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
 
-        with stream2:
-            stream2.wait_event(event)
+        with stream:
+            # Asynchronously copy batch to GPU
+            A_device[i][:batch_size].set(A[start:end])
 
-            # Compute L1 (Manhattan) distance
-            distances = cp.sum(cp.abs(A_batch_gpu - X_gpu), axis=1)
+            # Compute Manhattan (L1) distance
+            D_device[i][:batch_size] = cp.sum(cp.abs(A_device[i][:batch_size] - X_gpu), axis=1)
 
-            final_distances[start:end] = distances
+            # Store distances in final array
+            final_distances[start:end] = D_device[i][:batch_size]
 
+    # Wait for all GPU work to finish
     cp.cuda.Stream.null.synchronize()
 
+    # Select top K smallest distances
     top_k_indices = cp.argpartition(final_distances, K)[:K]
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
 
@@ -503,53 +535,60 @@ def our_kmeans_L2(N, D, A, K, return_loss=True):
 
     cluster_assignments = np.empty(N, dtype=np.int32)
 
-    # Initialise GPU centroids
+    # Initialize GPU centroids
     np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
 
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    event = cp.cuda.Event()
+    # Preallocate buffers and streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    assignments_gpu = [cp.empty(gpu_batch_size, dtype=cp.int32) for _ in range(gpu_batch_num)]
 
     for _ in range(max_iters):
         new_centroids = cp.zeros((K, D), dtype=cp.float32)
         counts = cp.zeros(K, dtype=cp.int32)
 
-        for start, end in gpu_batches:
-            with stream1:
-                A_batch_host = A[start:end]
-                A_batch_gpu = cp.asarray(A_batch_host, dtype=cp.float32)
-                stream1.record(event)
+        # 1. Assign clusters
+        for i, (start, end) in enumerate(gpu_batches):
+            stream = streams[i]
+            batch_size = end - start
 
-            with stream2:
-                stream2.wait_event(event)
+            with stream:
+                A_device[i][:batch_size].set(A[start:end])
 
-                A_norm = cp.sum(A_batch_gpu ** 2, axis=1).reshape(-1, 1)
+                A_batch = A_device[i][:batch_size]
+                A_norm = cp.sum(A_batch ** 2, axis=1).reshape(-1, 1)
                 C_norm = cp.sum(centroids_gpu ** 2, axis=1).reshape(1, -1)
-                distances = A_norm + C_norm - 2 * A_batch_gpu @ centroids_gpu.T
+                dot = A_batch @ centroids_gpu.T
+                distances = cp.sqrt(A_norm + C_norm - 2 * dot)
 
-                cluster_ids_batch = cp.argmin(distances, axis=1)
-                cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
+                assignments_gpu[i][:batch_size] = cp.argmin(distances, axis=1)
+                cluster_assignments[start:end] = cp.asnumpy(assignments_gpu[i][:batch_size])
 
-                ids_np = cluster_assignments[start:end]
-                A_np = A_batch_host
+        cp.cuda.Stream.null.synchronize()
 
-                for k in range(K):
-                    members = A_np[ids_np == k]
-                    if len(members) > 0:
-                        new_centroids[k] += cp.asarray(members.sum(axis=0))
-                        counts[k] += len(members)
+        # 2. Update centroids on CPU, then transfer result to GPU
+        for i, (start, end) in enumerate(gpu_batches):
+            ids_np = cluster_assignments[start:end]
+            A_np = A[start:end]
+
+            for k in range(K):
+                members = A_np[ids_np == k]
+                if len(members) > 0:
+                    new_centroids[k] += cp.asarray(members.sum(axis=0))
+                    counts[k] += len(members)
 
         counts = cp.maximum(counts, 1)
         updated_centroids = new_centroids / counts[:, None]
 
+        # Check for convergence
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
         if shift < tol:
             break
         centroids_gpu = updated_centroids
 
-    # Optionally compute loss for elbow plot
+    # 3. Compute loss if requested
     if return_loss:
         total_loss = 0.0
         centroids_cpu = cp.asnumpy(centroids_gpu)
@@ -557,7 +596,7 @@ def our_kmeans_L2(N, D, A, K, return_loss=True):
             members = A[cluster_assignments == k]
             if len(members) > 0:
                 diff = members - centroids_cpu[k]
-                total_loss += np.sum(diff ** 2)
+                total_loss += np.sum(np.sqrt(np.sum(diff ** 2, axis=1)))
         return cluster_assignments, total_loss
 
     return cluster_assignments
@@ -572,45 +611,51 @@ def our_kmeans_cosine(N, D, A, K, return_loss=False):
 
     cluster_assignments = np.empty(N, dtype=np.int32)
 
+    # Initialize centroids
     np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
     centroids_gpu /= cp.linalg.norm(centroids_gpu, axis=1, keepdims=True) + 1e-8
 
-    stream1 = cp.cuda.Stream(non_blocking=True)
-    stream2 = cp.cuda.Stream(non_blocking=True)
-    event = cp.cuda.Event()
+    # Preallocate device buffers and streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    assignments_gpu = [cp.empty(gpu_batch_size, dtype=cp.int32) for _ in range(gpu_batch_num)]
 
     for _ in range(max_iters):
         new_centroids = cp.zeros((K, D), dtype=cp.float32)
         counts = cp.zeros(K, dtype=cp.int32)
 
-        for start, end in gpu_batches:
-            with stream1:
-                A_batch_host = A[start:end]
-                A_batch_gpu = cp.asarray(A_batch_host, dtype=cp.float32)
-                stream1.record(event)
+        # Assign clusters in parallel across streams
+        for i, (start, end) in enumerate(gpu_batches):
+            stream = streams[i]
+            batch_size = end - start
 
-            with stream2:
-                stream2.wait_event(event)
+            with stream:
+                A_device[i][:batch_size].set(A[start:end])
 
-                norms = cp.linalg.norm(A_batch_gpu, axis=1, keepdims=True) + 1e-8
-                A_normalized = A_batch_gpu / norms
+                A_batch = A_device[i][:batch_size]
+                norms = cp.linalg.norm(A_batch, axis=1, keepdims=True) + 1e-8
+                A_normalized = A_batch / norms
 
                 similarity = A_normalized @ centroids_gpu.T
                 cosine_distance = 1.0 - similarity
 
-                cluster_ids_batch = cp.argmin(cosine_distance, axis=1)
-                cluster_assignments[start:end] = cp.asnumpy(cluster_ids_batch)
+                assignments_gpu[i][:batch_size] = cp.argmin(cosine_distance, axis=1)
+                cluster_assignments[start:end] = cp.asnumpy(assignments_gpu[i][:batch_size])
 
-                ids_np = cluster_assignments[start:end]
-                A_np = A_batch_host
+        cp.cuda.Stream.null.synchronize()
 
-                for k in range(K):
-                    members = A_np[ids_np == k]
-                    if len(members) > 0:
-                        new_centroids[k] += cp.asarray(members.sum(axis=0))
-                        counts[k] += len(members)
+        # Update centroids on CPU
+        for i, (start, end) in enumerate(gpu_batches):
+            ids_np = cluster_assignments[start:end]
+            A_np = A[start:end]
+
+            for k in range(K):
+                members = A_np[ids_np == k]
+                if len(members) > 0:
+                    new_centroids[k] += cp.asarray(members.sum(axis=0))
+                    counts[k] += len(members)
 
         counts = cp.maximum(counts, 1)
         updated_centroids = new_centroids / counts[:, None]
@@ -634,9 +679,6 @@ def our_kmeans_cosine(N, D, A, K, return_loss=False):
         return cluster_assignments, total_loss
 
     return cluster_assignments
-
-
-
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.2 code here
 # ------------------------------------------------------------------------------------------------
@@ -669,7 +711,7 @@ def our_ann_L2(N, D, A, X, K):
 
     # Compute L2 distance from X to each centroid
     diffs = centroids_gpu - X_gpu
-    dists_to_centroids = cp.sum(diffs ** 2, axis=1)
+    dists_to_centroids = cp.sqrt(cp.sum(diffs ** 2, axis=1))
 
     # Select K1 closest clusters
     K1 = num_clusters // 2
@@ -838,14 +880,17 @@ if __name__ == "__main__":
     kmeans_functions = []
     ann_functions = []
     
-    knn_result_cosine = our_knn_cosine_CUPY(N, D, A, X, K)
-    #knn_result_CUDA = our_knn_L2_CUDA(N, D, A, X, K)
-    ann_result = our_ann_cosine(N, D, A, X, K)
-    #print(f"KNN CUDA results = {knn_result_CUDA}")
-    print(f"KNN cosine results = {knn_result_cosine}")
-    print(f"ANN results (using knn_CUPY) = {ann_result}")
-    #print(f"Recall between knn_CUDA and ANN is {recall_rate(knn_result_CUDA, ann_result):.6f}")
-    print(f"Recall between knn_cosine and ANN is {recall_rate(knn_result_cosine, ann_result):.6f}")
+    #knn_result_cosine = our_knn_cosine_CUPY(N, D, A, X, K)
+    knn_result_CUDA = our_knn_L2_CUDA(N, D, A, X, K)
+    #knn_result_CUPY_L2 = our_knn_L2_CUPY(N, D, A, X, K)
+    #ann_result = our_ann_cosine(N, D, A, X, K)
+    ann_result_L2 = our_ann_L2(N, D, A, X, K)
+    print(f"KNN CUDA results = {knn_result_CUDA}")
+    #print(f"KNN CUPY results = {knn_result_CUPY_L2}")
+    #print(f"KNN cosine results = {knn_result_cosine}")
+    #print(f"ANN results (using knn_CUPY) = {ann_result}")
+    print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result_CUDA, ann_result_L2):.6f}")
+    #print(f"Recall between knn_cosine and ANN is {recall_rate(knn_result_cosine, ann_result):.6f}")
 
     """
     if knn_functions:

@@ -535,18 +535,14 @@ def our_knn_L1_CUPY(N, D, A, X, K):
 # def distance_kernel(X, Y, D):
 #     pass
 
-import cupy as cp
-import numpy as np
-
-# return_loss = True for elbow plots
-def our_kmeans_L2(N, D, A, K, return_loss=False):
-    max_iters = 20
+def our_kmeans_L2(N, D, A, K):
+    max_iters = 25
     tol = 1e-4
     gpu_batch_num = 20
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
-    cluster_assignments = np.empty(N, dtype=np.int32)
+    cluster_assignments = cp.empty(N, dtype=np.int32)
 
     # Initialise GPU centroids
     np.random.seed(42)
@@ -558,7 +554,8 @@ def our_kmeans_L2(N, D, A, K, return_loss=False):
     A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
     assignments_gpu = [cp.empty(gpu_batch_size, dtype=cp.int32) for _ in range(gpu_batch_num)]
 
-    for _ in range(max_iters):
+    for i in range(max_iters):
+        print(f"Max iters is {i}")
         cluster_sum = cp.zeros((K, D), dtype=cp.float32)
         counts = cp.zeros(K, dtype=cp.int32)
 
@@ -582,14 +579,15 @@ def our_kmeans_L2(N, D, A, K, return_loss=False):
                 # cp.argmin returns a 1D array of size batch_size. Each element is the index of the closest centroid
                 assignments_gpu[i][:batch_size] = cp.argmin(distances, axis=1)
                 # Copy the assignments back to the CPU array for centroid update
-                cluster_assignments[start:end] = cp.asnumpy(assignments_gpu[i][:batch_size])
+                cluster_assignments[start:end] = assignments_gpu[i][:batch_size]
 
         cp.cuda.Stream.null.synchronize()
 
+        cluster_assignments_cpu = cp.asnumpy(cluster_assignments)
         # Update centroids on CPU, then transfer result to GPU
         for i, (start, end) in enumerate(gpu_batches):
             # ids_np is the array of cluster IDs for the batch (i.e. which centroid each vector is assigned to)
-            ids_np = cluster_assignments[start:end]
+            ids_np = cluster_assignments_cpu[start:end]
             # A_np is the corresponding batch of vectors
             A_np = A[start:end]
 
@@ -603,32 +601,34 @@ def our_kmeans_L2(N, D, A, K, return_loss=False):
                     # Count the number of vectors in the cluster
                     counts[k] += len(members)
 
+        # Detect dead centroids before avoiding division by zero
+        dead_mask = (counts == 0)
+        
+        # Avoid division by zero
         # Send the counts of vectors in each cluster back to the GPU
         counts = cp.maximum(counts, 1)
         # By keeping cluster_sum and counts on the GPU, updated_centroids can be computed on the GPU
         updated_centroids = cluster_sum / counts[:, None]
+        
+        # Reinitialise dead centroids with random data points
+        if cp.any(dead_mask):
+            num_dead = int(cp.sum(dead_mask).get())
+            reinit_indices = np.random.choice(N, num_dead, replace=False)
+            reinit_centroids = cp.asarray(A[reinit_indices], dtype=cp.float32)
+            updated_centroids[dead_mask] = reinit_centroids
 
         # Check for convergence
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
+        print(f"Shift is {shift}")
+        print(f"Dead centroids: {cp.sum(dead_mask).item()}")
         if shift < tol:
             break
         centroids_gpu = updated_centroids
+    # Also return the centroids on the CPU
+    return cluster_assignments, centroids_gpu
 
-    # 3. Compute loss if requested
-    if return_loss:
-        total_loss = 0.0
-        centroids_cpu = cp.asnumpy(centroids_gpu)
-        for k in range(K):
-            members = A[cluster_assignments == k]
-            if len(members) > 0:
-                diff = members - centroids_cpu[k]
-                total_loss += np.sum(np.sqrt(np.sum(diff ** 2, axis=1)))
-        return cluster_assignments, total_loss
 
-    return cluster_assignments
-
-# return_loss = True for elbow plots
-def our_kmeans_cosine(N, D, A, K, return_loss=False):
+def our_kmeans_cosine(N, D, A, K):
     max_iters = 20
     tol = 1e-4
     gpu_batch_num = 30
@@ -683,147 +683,141 @@ def our_kmeans_cosine(N, D, A, K, return_loss=False):
                     cluster_sum[k] += cp.asarray(members.sum(axis=0))
                     counts[k] += len(members)
 
+        # Identify dead centroids
+        dead_mask = (counts == 0)
+
+        # Avoid division by zero
         counts = cp.maximum(counts, 1)
         updated_centroids = cluster_sum / counts[:, None]
         updated_centroids /= cp.linalg.norm(updated_centroids, axis=1, keepdims=True) + 1e-8
+
+        # Reinitialize any dead centroids with random points from A
+        if cp.any(dead_mask):
+            num_dead = int(cp.sum(dead_mask).get())
+            reinit_indices = np.random.choice(N, num_dead, replace=False)
+            reinit_centroids = cp.asarray(A[reinit_indices], dtype=cp.float32)
+            reinit_centroids /= cp.linalg.norm(reinit_centroids, axis=1, keepdims=True) + 1e-8
+            updated_centroids[dead_mask] = reinit_centroids
 
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
         if shift < tol:
             break
         centroids_gpu = updated_centroids
 
-    if return_loss:
-        total_loss = 0.0
-        centroids_cpu = cp.asnumpy(centroids_gpu)
-        centroids_cpu /= np.linalg.norm(centroids_cpu, axis=1, keepdims=True) + 1e-8
-        for k in range(K):
-            members = A[cluster_assignments == k]
-            if len(members) > 0:
-                members_normed = members / (np.linalg.norm(members, axis=1, keepdims=True) + 1e-8)
-                sims = members_normed @ centroids_cpu[k]
-                total_loss += np.sum(1.0 - sims)
-        return cluster_assignments, total_loss
-
-    return cluster_assignments
+    return cluster_assignments, centroids_gpu
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.2 code here
 # ------------------------------------------------------------------------------------------------
-
-# You can create any kernel here
 
 def our_ann_L2(N, D, A, X, K):
     # Run KMeans clustering on A to get cluster assignments and centroids
     num_clusters = 100
     # Run KMeans to cluster data into K clusters
-    cluster_assignments, _ = our_kmeans_L2(N, D, A, num_clusters, return_loss=True)
+    cluster_assignments, centroids_np = our_kmeans_L2(N, D, A, num_clusters)
+    num_clusters = centroids_gpu.shape[0]
+    X_gpu = cp.asarray(X, dtype=cp.float32)
 
-    # Initialise list to store the centroids
-    centroids = []
-    for k in range(num_clusters):
-        # Gather all members of the cluster (on CPU)
-        members = A[cluster_assignments == k]
-        if len(members) > 0:
-            # Compute the centroid of the cluster and append to the list of centroids
-            centroids.append(np.mean(members, axis=0))
-        else:
-            centroids.append(np.zeros(D, dtype=np.float32))  # handle empty cluster
-        # Centroids is currenlty a list of numpy arrays, with each list element being a 1D numpy array of size D
-        # Convert it to a 2D cupy array with dimensions(num_clusters, D)
-        centroids_np = np.stack(centroids).astype(np.float32)
+    # Step 1: Find K1 closest centroids (on GPU)
+    distances = cp.linalg.norm(centroids_gpu - X_gpu, axis=1)
+    K1 = num_clusters // 10
+    top_cluster_ids = cp.argpartition(distances, K1)[:K1]
+    top_clusters_set = cp.zeros(num_clusters, dtype=cp.bool_)
+    top_clusters_set[top_cluster_ids] = True
+    mask = top_clusters_set[cluster_assignments]
+    all_indices_gpu = cp.nonzero(mask)[0]
 
+    if all_indices_gpu.size == 0:
+        return np.array([], dtype=np.int32)
 
-    # Select K1 closest clusters
-    K1 = num_clusters // 2
-    # Find the K1 closest clusters to the query vector X
-    top_cluster_ids = our_knn_L2_CUPY(num_clusters, D, centroids_np, X, K1)
-    # Define K2 candidates to gather from each of the K1 closest clusters
-    K2 = (N // num_clusters) // 2
+    # Copy candidate indices to CPU once
+    all_indices_cpu = cp.asnumpy(all_indices_gpu)
+    candidate_N = all_indices_cpu.shape[0]
 
-    # For each of K1 clusters, run KNN to get K2 candidates
-    candidate_vectors = []
-    original_indices = []
+    # Allocate final distance buffer
+    final_distances = cp.empty(candidate_N, dtype=cp.float32)
 
-    # Iterate over the top K1 clusters
-    for cluster_id in top_cluster_ids:
-        # Create boolean array to determine which vectors belong to the current cluster
-        cluster_mask = (cluster_assignments == cluster_id)
-        # Get the indices of the vectors in the current cluster
-        cluster_indices = np.where(cluster_mask)[0]
+    # Streamed batch KNN on candidate pool (like our_knn_L2_CUPY)
+    gpu_batch_num = 5
+    gpu_batch_size = (candidate_N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
 
-        # Skip empty clusters
-        if len(cluster_indices) == 0:
-            continue
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
+        with stream:
+            A_device[i][:batch_size].set(A[all_indices_cpu[start:end]])
+            A_batch = A_device[i][:batch_size]
+            D_device[i][:batch_size] = cp.linalg.norm(A_batch - X_gpu, axis=1)
+            final_distances[start:end] = D_device[i][:batch_size]
 
-        # Gather the vectors in the current cluster
-        cluster_vectors = A[cluster_indices]
-        # local_K is the number of candidates to gather from this cluster
-        local_K = min(K2, len(cluster_vectors))
-        # Run knn to get the local K nearest neighbors from this cluster
-        local_knn_ids = our_knn_L2_CUPY(len(cluster_vectors), D, cluster_vectors, X, local_K)
-        
-        selected = cluster_vectors[local_knn_ids]
-        candidate_vectors.append(selected)
-        # Keep track of the original indices of the selected candidates. Needed for final result
-        original_indices.extend(cluster_indices[local_knn_ids])
+    cp.cuda.Stream.null.synchronize()
 
-    # Final top-K from K1 × K2 pool
-    # Vertically stack all candidate vectors into a single array
-    # This will be a 2D array of shape (total_candidates, D)
-    final_pool = np.vstack(candidate_vectors)
-    M = final_pool.shape[0]
-    final_knn_ids = our_knn_L2_CUPY(M, D, final_pool, X, K)
-
-    # Map back to original indices
-    final_result = np.array(original_indices)[final_knn_ids]
+    # Final Top-K selection
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    final_result = all_indices_cpu[cp.asnumpy(sorted_top_k_indices)]
     return final_result
 
 def our_ann_cosine(N, D, A, X, K):
+    # Step 0: Build the index (KMeans using cosine distance)
     num_clusters = 300
-    cluster_assignments, _ = our_kmeans_cosine(N, D, A, num_clusters, return_loss=True)
+    cluster_assignments, centroids_gpu = our_kmeans_cosine(N, D, A, num_clusters)
 
-    # Step 1: Compute normalized centroids on CPU
-    centroids = []
-    for k in range(num_clusters):
-        members = A[cluster_assignments == k]
-        if len(members) > 0:
-            centroid = np.mean(members, axis=0)
-            centroid /= np.linalg.norm(centroid) + 1e-8
-            centroids.append(centroid)
-        else:
-            centroids.append(np.zeros(D, dtype=np.float32))  # Handle empty cluster
-    centroids_np = np.stack(centroids).astype(np.float32)
+    # Step 1: Move query to GPU and normalize it
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+    X_gpu /= cp.linalg.norm(X_gpu) + 1e-8  # Normalize for cosine similarity
 
-    # Step 2: Use cosine KNN to find K1 closest clusters to X
+    # Step 2: Find K1 closest clusters using cosine similarity
     K1 = num_clusters // 2
-    top_cluster_ids = our_knn_cosine_CUPY(num_clusters, D, centroids_np, X, K1)
+    centroids_gpu_normed = centroids_gpu / (cp.linalg.norm(centroids_gpu, axis=1, keepdims=True) + 1e-8)
+    similarities = centroids_gpu_normed @ X_gpu
+    top_cluster_ids = cp.argpartition(-similarities, K1)[:K1]  # Use negative to get top-K
 
-    # Step 3: Define K2 candidates per selected cluster
-    K2 = (N // num_clusters) // 2
-    candidate_vectors = []
-    original_indices = []
+    # Step 3: Create mask to select points from top K1 clusters
+    top_clusters_set = cp.zeros(num_clusters, dtype=cp.bool_)
+    top_clusters_set[top_cluster_ids] = True
+    mask = top_clusters_set[cluster_assignments]
+    all_indices_gpu = cp.nonzero(mask)[0]
 
-    # Step 4: For each top cluster, collect K2 local candidates
-    for cluster_id in top_cluster_ids:
-        cluster_mask = (cluster_assignments == cluster_id)
-        cluster_indices = np.where(cluster_mask)[0]
-        if len(cluster_indices) == 0:
-            continue
+    if all_indices_gpu.size == 0:
+        return np.array([], dtype=np.int32)
 
-        cluster_vectors = A[cluster_indices]
-        local_K = min(K2, len(cluster_vectors))
-        local_knn_ids = our_knn_cosine_CUPY(len(cluster_vectors), D, cluster_vectors, X, local_K)
+    # Step 4: Move selected candidate vectors to GPU in batches (streamed)
+    all_indices_cpu = cp.asnumpy(all_indices_gpu)
+    candidate_N = len(all_indices_cpu)
 
-        selected = cluster_vectors[local_knn_ids]
-        candidate_vectors.append(selected)
-        original_indices.extend(cluster_indices[local_knn_ids])
+    gpu_batch_size = 100_000
+    gpu_batch_num = (candidate_N + gpu_batch_size - 1) // gpu_batch_size
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
 
-    # Step 5: Final KNN on all candidates
-    final_pool = np.vstack(candidate_vectors)
-    M = final_pool.shape[0]
-    final_knn_ids = our_knn_cosine_CUPY(M, D, final_pool, X, K)
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    S_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
+    similarities_final = cp.empty(candidate_N, dtype=cp.float32)
 
-    final_result = np.array(original_indices)[final_knn_ids]
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
+        with stream:
+            A_device[i][:batch_size].set(A[all_indices_cpu[start:end]])
+            A_batch = A_device[i][:batch_size]
+            # Normalize each vector in the batch
+            A_batch_normed = A_batch / (cp.linalg.norm(A_batch, axis=1, keepdims=True) + 1e-8)
+            S_device[i][:batch_size] = A_batch_normed @ X_gpu
+            similarities_final[start:end] = S_device[i][:batch_size]
+
+    cp.cuda.Stream.null.synchronize()
+
+    # Step 5: Top-K selection using cosine similarity
+    top_k_indices = cp.argpartition(-similarities_final, K)[:K]
+    sorted_top_k = top_k_indices[cp.argsort(-similarities_final[top_k_indices])]
+    final_result = all_indices_cpu[cp.asnumpy(sorted_top_k)]
+
     return final_result
+
 
 # ------------------------------------------------------------------------------------------------
 # Test your code here
@@ -855,13 +849,62 @@ def test_knn(func, N, D, A, X, K, repeat):
     avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
     print(f"CuPy {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
     
-def test_ann(func, N, D, A, X, K, repeat):
-# Warm up, first run seems to be a lot longer than the subsequent runs
-    result = func(N, D, A, X, K)
+# TESTING: Do not include clustering when comparing ann to knn
+def our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu): 
+    num_clusters = centroids_gpu.shape[0]
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+
+    # Step 1: Find K1 closest centroids (on GPU)
+    distances = cp.linalg.norm(centroids_gpu - X_gpu, axis=1)
+    K1 = num_clusters // 10
+    top_cluster_ids = cp.argpartition(distances, K1)[:K1]
+    top_clusters_set = cp.zeros(num_clusters, dtype=cp.bool_)
+    top_clusters_set[top_cluster_ids] = True
+    mask = top_clusters_set[cluster_assignments]
+    all_indices_gpu = cp.nonzero(mask)[0]
+
+    if all_indices_gpu.size == 0:
+        return np.array([], dtype=np.int32)
+
+    # Copy candidate indices to CPU once
+    all_indices_cpu = cp.asnumpy(all_indices_gpu)
+    candidate_N = all_indices_cpu.shape[0]
+
+    # Allocate final distance buffer
+    final_distances = cp.empty(candidate_N, dtype=cp.float32)
+
+    # Streamed batch KNN on candidate pool (like our_knn_L2_CUPY)
+    gpu_batch_num = 3
+    gpu_batch_size = (candidate_N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
+
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
+        with stream:
+            A_device[i][:batch_size].set(A[all_indices_cpu[start:end]])
+            A_batch = A_device[i][:batch_size]
+            D_device[i][:batch_size] = cp.linalg.norm(A_batch - X_gpu, axis=1)
+            final_distances[start:end] = D_device[i][:batch_size]
+
+    cp.cuda.Stream.null.synchronize()
+
+    # Final Top-K selection
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    final_result = all_indices_cpu[cp.asnumpy(sorted_top_k_indices)]
+    return final_result
+
+def test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_np):
+    # Warm up, first run seems to be a lot longer than the subsequent runs
+    result = func(N, D, A, X, K, cluster_assignments, centroids_np)
     start = time.time()
     for _ in range(repeat):
         # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
-        result = func(N, D, A, X, K)
+        result = func(N, D, A, X, K, cluster_assignments, centroids_np)
     # Synchronise to ensure all GPU computations are finished before measuring end time
     cp.cuda.Stream.null.synchronize()
     end = time.time()
@@ -878,41 +921,35 @@ def recall_rate(list1, list2):
 
 if __name__ == "__main__":
     np.random.seed(42)
-    N = 480000
-    D = 512
+    N = 1000000
+    D = 1024
     A = np.random.randn(N, D).astype(np.float32)
     X = np.random.randn(D).astype(np.float32)
     K = 10
     repeat = 1
-
-    knn_functions = []
-    kmeans_functions = []
-    ann_functions = []
+    num_clusters = 500
     
-    knn_result_cosine = our_knn_cosine_CUPY(N, D, A, X, K)
-    #knn_result_CUDA = our_knn_L2_CUDA(N, D, A, X, K)
-    #knn_result_CUPY_L2 = our_knn_L2_CUPY(N, D, A, X, K)
-    ann_result_cosine = our_ann_cosine(N, D, A, X, K)
-    #ann_result_L2 = our_ann_L2(N, D, A, X, K)
-    #print(f"KNN CUDA results = {knn_result_CUDA}")
-    #print(f"KNN CUPY results = {knn_result_CUPY_L2}")
-    #print(f"KNN cosine results = {knn_result_cosine}")
-    #print(f"ANN results (using knn_CUPY) = {ann_result_L2}")
-    print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result_cosine, ann_result_cosine):.6f}")
-    #print(f"Recall between knn_cosine and ANN is {recall_rate(knn_result_cosine, ann_result):.6f}")
+    # Build index for testing ann and comparing to knn
+    cluster_assignments, centroids_gpu = our_kmeans_L2(N, D, A, num_clusters)
 
-
+    knn_functions = [our_knn_L2_CUPY]
+    kmeans_functions = []
+    ann_functions = [our_ann_L2_query_only]
+    # Testing recall
+    ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
+    knn_result = our_knn_L2_CUPY(N, D, A, X, K)
+    print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
+ 
     if knn_functions:
         for func in knn_functions:
             test_knn(func, N, D, A, X, K, repeat)
     
     if kmeans_functions:
-        num_clusters = 100 # From elbow plots
         for func in kmeans_functions:
             test_kmeans(func, N, D, A, num_clusters, repeat)
             
     if ann_functions:
         for func in ann_functions:
-            test_ann(func, N, D, A, X, K, repeat)
+            test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
 
         

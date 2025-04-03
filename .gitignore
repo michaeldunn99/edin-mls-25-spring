@@ -1,0 +1,28 @@
+# uv virtual environment
+.uv/
+
+# Regular virtual environments (in case you used one)
+.venv/
+venv/
+env/
+
+# Pyenv version file
+.python-version
+
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+
+# OS junk
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Testing/cache tools
+.mypy_cache/
+.pyright/
+.hypothesis/
+.tox/
+coverage.*

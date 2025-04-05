@@ -7,35 +7,40 @@ import argparse
 from statistics import mean, median, quantiles
 from typing import List
 
-# Configuration
-ENDPOINT = "http://localhost:8000/rag"
+# --- Logical endpoints mapped to actual URLs ---
+TARGET_ENDPOINTS = {
+    "original": "http://localhost:8001/rag",
+    "load_balancer_round_robin": "http://localhost:9000/rag"
+}
+
+# --- Global config ---
 QUERY = "Which animals can hover in the air?"
 K = 2
-
 REQUEST_RATES = [1, 5, 10, 20, 50, 100]
 REQUESTS_PER_RATE = 100
 TIMEOUT = 30.0
 CSV_FILENAME = "end_to_end_results.csv"
-POISSON_SEED = 42  # Ensures reproducibility for poisson mode
+POISSON_SEED = 42  # For reproducibility
 
-# Result class
+# --- Result container ---
 class RequestResult:
     def __init__(self, latency: float, status_code: int):
         self.latency = latency
-        # Store HTTP status code
         self.status_code = status_code
 
-async def send_request(client: httpx.AsyncClient, session_id: int) -> RequestResult:
+# --- Send one request ---
+async def send_request(client: httpx.AsyncClient, session_id: int, endpoint: str) -> RequestResult:
     payload = {"query": QUERY, "k": K}
     start = time.time()
     try:
-        response = await client.post(ENDPOINT, json=payload)
+        response = await client.post(endpoint, json=payload)
         latency = time.time() - start
         return RequestResult(latency, response.status_code)
     except Exception:
         return RequestResult(latency=float('inf'), status_code=0)
 
-async def run_test_at_rps(rps: int, mode: str) -> List[RequestResult]:
+# --- Run test at given RPS ---
+async def run_test_at_rps(rps: int, mode: str, endpoint: str) -> List[RequestResult]:
     if mode == "poisson":
         random.seed(POISSON_SEED)
 
@@ -43,7 +48,7 @@ async def run_test_at_rps(rps: int, mode: str) -> List[RequestResult]:
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         tasks = []
         for i in range(REQUESTS_PER_RATE):
-            tasks.append(send_request(client, i))
+            tasks.append(asyncio.create_task(send_request(client, i, endpoint)))
 
             if mode == "ideal":
                 interval = 1 / rps
@@ -57,6 +62,7 @@ async def run_test_at_rps(rps: int, mode: str) -> List[RequestResult]:
         results = await asyncio.gather(*tasks)
     return results
 
+# --- Compute latency and throughput stats ---
 def compute_metrics(results: List[RequestResult]):
     latencies = [r.latency for r in results if r.status_code == 200]
     failed = [r for r in results if r.status_code != 200]
@@ -74,8 +80,9 @@ def compute_metrics(results: List[RequestResult]):
     }
     return stats
 
-def save_results_to_csv(results_dict, mode: str):
-    filename = f"{mode}_{CSV_FILENAME}"
+# --- Save results to CSV ---
+def save_results_to_csv(results_dict, mode: str, target: str):
+    filename = f"{target}_{mode}_{CSV_FILENAME}"
     headers = [
         "rps", "requests_sent", "successful", "failed", "mean_latency",
         "median_latency", "p90_latency", "p95_latency", "p99_latency", "throughput_rps"
@@ -88,25 +95,35 @@ def save_results_to_csv(results_dict, mode: str):
             row.update(stats)
             writer.writerow(row)
 
-async def main(mode: str):
-    all_results = {}
+# --- Main test loop ---
+async def main(mode: str, target: str):
+    endpoint = TARGET_ENDPOINTS.get(target)
+    if endpoint is None:
+        raise ValueError(f"Unknown target: {target}")
 
+    print(f"\n Target: {target} → {endpoint}")
+    print(f" Mode: {mode}")
+
+    all_results = {}
     for rps in REQUEST_RATES:
         print(f"\n=== Testing at {rps} RPS ({mode} mode) ===")
-        results = await run_test_at_rps(rps, mode)
+        results = await run_test_at_rps(rps, mode, endpoint)
         stats = compute_metrics(results)
 
         for key, value in stats.items():
             print(f"{key}: {value}")
         all_results[rps] = stats
 
-    save_results_to_csv(all_results, mode)
-    print(f"\n Results saved to {mode}_{CSV_FILENAME}")
+    save_results_to_csv(all_results, mode, target)
+    print(f"\n Results saved to: {target}_{mode}_{CSV_FILENAME}")
 
+# --- CLI entrypoint ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load test RAG endpoint")
     parser.add_argument("--mode", choices=["ideal", "poisson"], default="ideal",
                         help="Request arrival pattern: ideal (default) or poisson")
+    parser.add_argument("--target", choices=["original", "load_balancer_round_robin"], default="original",
+                        help="Which endpoint to test (original or load_balancer_round_robin)")
     args = parser.parse_args()
 
-    asyncio.run(main(args.mode))
+    asyncio.run(main(args.mode, args.target))

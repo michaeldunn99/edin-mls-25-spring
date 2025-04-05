@@ -1016,32 +1016,580 @@ def compute_l2_distances_in_chunks(A_numpy, X_numpy, chunk_size=1000, gpu_memory
 # def distance_kernel(X, Y, D):
 #     pass
 
-# @triton.jit
-# def distance_k_means_kernel(centroids,
-#                             A_chunk
+
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+
+@triton.jit
+def update_cluster_assignments_kernel(
+    A_ptr,                    # Pointer to data points (chunk of A)
+    C_ptr,                    # Pointer to centroids
+    assignments_ptr,          # Pointer to output assignments
+    K,                        # Number of centroids
+    D,                        # Number of features (dimensions)
+    A_start_idx,              # Global start index for this chunk
+    BLOCK_D: tl.constexpr,    # Block size along dimension
+):
+    pid = tl.program_id(0)  # Index of the point being processed
+    a_ptr = A_ptr + pid * D
+
+    # Load all features for current point (in chunks)
+    final_min_dist = 1e10
+    final_min_idx = -1
+
+    for k in range(K):
+        # Pointer to the k-th centroid
+        c_ptr = C_ptr + k * D
+
+        dist = 0.0
+        for d_start in range(0, D, BLOCK_D):
+            d_off = tl.arange(0, BLOCK_D)
+            mask = (d_start + d_off) < D
+
+            a = tl.load(a_ptr + d_start + d_off, mask=mask, other=0.0)
+            c = tl.load(c_ptr + d_start + d_off, mask=mask, other=0.0)
+
+            diff = a - c
+            dist += tl.sum(diff * diff)
+
+        is_closer = dist < final_min_dist
+        final_min_dist = tl.where(is_closer, dist, final_min_dist)
+        final_min_idx = tl.where(is_closer, k, final_min_idx)
+
+    tl.store(assignments_ptr + A_start_idx + pid, final_min_idx)
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def update_cluster_sum_and_counts_kernel(
+    A_ptr,                 # [N, D]
+    offsets_ptr,          # [K+1]
+    output_ptr,           # [K, D] — cluster sum buffer
+    counts_ptr,           # [K]    — cluster count buffer
+    D: tl.constexpr,
+    stride_ad,
+    stride_od,
+    BLOCK_D: tl.constexpr,
+):
+    cluster_id = tl.program_id(0)
+
+    # Load start/end of this cluster's data
+    start_idx = tl.load(offsets_ptr + cluster_id)
+    end_idx = tl.load(offsets_ptr + cluster_id + 1)
+    count = end_idx - start_idx
+
+    if count == 0:
+        return
+
+    offs_d = tl.arange(0, BLOCK_D)
+    for d_start in range(0, D, BLOCK_D):
+        d_mask = (d_start + offs_d) < D
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        for i in range(count):
+            row_idx = start_idx + i
+            row_ptr = A_ptr + row_idx * stride_ad + d_start + offs_d
+            vec = tl.load(row_ptr, mask=d_mask, other=0.0)
+            acc += vec
+
+        out_ptr = output_ptr + cluster_id * stride_od + d_start + offs_d
+        tl.store(out_ptr, acc, mask=d_mask)
+
+    # Store the count at the end
+    tl.store(counts_ptr + cluster_id, count)
+
+
+class TritonKMeans:
+    def __init__(self, n_clusters, max_iter=300, tol=1e-4, batch_size=2048, block_d=128, block_a=32,verbose=False):
+        self.K = n_clusters
+        self.max_iter = max_iter
+        self.tol = tol
+        self.batch_size = batch_size
+        self.block_d = block_d
+        self.block_a = block_a
+        self.verbose = verbose
+
+        self.centroids_gpu = None
+        self.cluster_assignments = None
+
+    def fit(self, A):
+        N, D = A.shape
+        K = self.K
+
+        # Randomly initialize centroids
+        torch.manual_seed(42)
+        init_indices = torch.randperm(N)[:K]
+        centroids = torch.from_numpy(A[init_indices.numpy()])
+        self.centroids_gpu = centroids.to('cuda')
+
+        # Cluster assignment buffer (on GPU)
+        self.cluster_assignments = torch.empty(N, dtype=torch.int32, device='cuda')
+
+        start_time = time.time()
+        reinitialized_last_iter = False
+
+        for i in range(self.max_iter):
+            iter_start = time.time()
+
+            self._update_cluster_assignments(A, N, D)
+            torch.cuda.synchronize()
+
+            total_diff, new_centroids, cluster_counts = self._update_centroid_vectors(A, N, D)
+
+            disappeared = cluster_counts == 0
+            if disappeared.any():
+                rand_idxs = torch.randint(0, N, (disappeared.sum().item(),), device='cpu')
+                reinit_centroids = torch.from_numpy(A[rand_idxs.numpy()]).to('cuda')
+                new_centroids[disappeared] = reinit_centroids
+                reinitialized_last_iter = True
+            else:
+                if not reinitialized_last_iter and total_diff < self.tol:
+                    if self.verbose:
+                        print(f"Converged at iteration {i}, total movement: {total_diff.item():.6f}")
+                    break
+                reinitialized_last_iter = False
+
+            self.centroids_gpu = new_centroids
+
+            if self.verbose:
+                print(f"Iteration {i}: total_diff={total_diff.item():.6f}, time={(time.time() - iter_start):.2f}s")
+
+        if self.verbose:
+            print(f"Total time: {(time.time() - start_time):.2f}s")
+
+    def predict(self):
+        return self.cluster_assignments.cpu().numpy()
+
+    def _update_cluster_assignments(self, A, N, D):
+        # from your_kernels import update_cluster_assignments_kernel  # Import your actual Triton kernel here
+
+        BATCH_SIZE = self.batch_size
+        BLOCK_D = self.block_d
+
+        load_stream = torch.cuda.Stream()
+        compute_stream = torch.cuda.Stream()
+        batch_num = triton.cdiv(N, BATCH_SIZE)
+        batches = [(i * BATCH_SIZE, min((i+1) * BATCH_SIZE, N)) for i in range(batch_num)]
+        A_gpu_buffers = [torch.empty((BATCH_SIZE, D), device='cuda') for _ in range(2)]
+
+        for i, (start, end) in enumerate(batches):
+            batch_size = end - start
+            A_gpu_chunk = A_gpu_buffers[i % 2]
+            with torch.cuda.stream(load_stream):
+                A_gpu_chunk[:batch_size].copy_(torch.from_numpy(A[start:end]).to('cuda'))
+                load_event = torch.cuda.Event()
+                load_event.record(load_stream)
+
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(load_event)
+                grid = (batch_size,)
+                update_cluster_assignments_kernel[grid](
+                    A_gpu_chunk,
+                    self.centroids_gpu,
+                    self.cluster_assignments,
+                    self.K,
+                    D,
+                    start,
+                    BLOCK_D
+                )
+
+    def _update_centroid_vectors(self, A, N, D):
+        new_centroids_vector_sums_gpu = torch.zeros((self.K, D), device='cuda')
+        new_centroids_vector_counts = torch.zeros(self.K, dtype=torch.int32, device='cuda')
+
+        BATCH_SIZE = self.batch_size
+        BLOCK_D = self.block_d
+
+        cluster_assignments_cpu = self.cluster_assignments.cpu()
+
+        load_stream = torch.cuda.Stream()
+        compute_stream = torch.cuda.Stream()
+
+        batch_num = triton.cdiv(N, BATCH_SIZE)
+        batches = [(i * BATCH_SIZE, min((i + 1) * BATCH_SIZE, N)) for i in range(batch_num)]
+
+        A_gpu_buffers = [torch.empty((BATCH_SIZE, D), device='cuda') for _ in range(2)]
+        partial_sums = torch.empty_like(new_centroids_vector_sums_gpu)
+        partial_counts = torch.empty_like(new_centroids_vector_counts)
+        cluster_offsets = torch.empty(self.K + 1, dtype=torch.int32, device='cuda')
+
+        for i, (start, end) in enumerate(batches):
+            batch_size = end - start
+            A_chunk_cpu = torch.as_tensor(A[start:end])  # Ensure PyTorch tensor
+            assignment_chunk = cluster_assignments_cpu[start:end]
+
+            # Step 1: sort assignments and reorder A_chunk
+            sorted_assignments, sorted_indices = torch.sort(assignment_chunk)
+            reordered_rows = A_chunk_cpu[sorted_indices]
+
+            # Step 2: compute cluster offsets
+            counts = torch.bincount(sorted_assignments, minlength=self.K)
+            offsets = torch.cat([torch.tensor([0], dtype=torch.int32), counts.cumsum(0)])
+
+            # Select buffer
+            A_gpu_chunk = A_gpu_buffers[i % 2]
+
+            # Step 3: async transfer on load stream
+            with torch.cuda.stream(load_stream):
+                A_gpu_chunk[:batch_size].copy_(reordered_rows.to('cuda', non_blocking=True))
+                cluster_offsets.copy_(offsets.to('cuda', non_blocking=True))
+                load_event = torch.cuda.Event()
+                load_stream.record_event(load_event)
+
+            # Step 4: compute stream — wait, zero, run kernel
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_event(load_event)
+
+                partial_sums.zero_()
+                partial_counts.zero_()
+
+                grid = (self.K,)
+                update_cluster_sum_and_counts_kernel[grid](
+                    A_gpu_chunk,
+                    cluster_offsets,
+                    partial_sums,
+                    partial_counts,
+                    D,
+                    A_gpu_chunk.stride(0),
+                    partial_sums.stride(0),
+                    BLOCK_D
+                )
+
+            # Accumulate results on the default stream (after compute finishes)
+            torch.cuda.current_stream().wait_stream(compute_stream)
+            new_centroids_vector_sums_gpu += partial_sums
+            new_centroids_vector_counts += partial_counts
+
+        torch.cuda.synchronize()
+
+        safe_counts = new_centroids_vector_counts.clamp(min=1)
+        new_centroid_vectors = new_centroids_vector_sums_gpu / safe_counts[:, None]
+        total_squared_difference = torch.sum((new_centroid_vectors - self.centroids_gpu) ** 2)
+
+        return total_squared_difference, new_centroid_vectors, new_centroids_vector_counts
+
+
+
+def benchmark_kmeans_configs(A_np, configs, K=10, max_iter=10, tol=1e-4, num_trials=3):
+    """
+    Benchmarks different (batch_size, block_d) configs for TritonKMeans.
+    
+    Args:
+        A_np (np.ndarray): Input data (N, D), as a NumPy array.
+        configs (list of tuple): List of (batch_size, block_d) tuples to test.
+        K (int): Number of clusters.
+        max_iter (int): Max iterations per k-means run.
+        tol (float): Convergence tolerance.
+        num_trials (int): Number of runs per config (average taken).
+        
+    Returns:
+        best_config (tuple): The (batch_size, block_d) config with lowest avg runtime.
+        timings (dict): Mapping from config to average runtime.
+    """
+    N, D = A_np.shape
+    timings = {}
+
+    for batch_size, block_d in configs:
+        total_time = 0.0
+        print(f"\n🧪 Testing config: batch_size={batch_size}, block_d={block_d}")
+        for trial in range(num_trials):
+            # Reset seed for reproducibility
+            torch.manual_seed(42)
+
+            model = TritonKMeans(
+                n_clusters=K,
+                max_iter=max_iter,
+                tol=tol,
+                batch_size=batch_size,
+                block_d=block_d,
+                verbose=False
+            )
+
+            start = time.time()
+            model.fit(A_np)
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
+            total_time += elapsed
+            print(f"  Trial {trial + 1}: {elapsed:.4f} seconds")
+
+        avg_time = total_time / num_trials
+        timings[(batch_size, block_d)] = avg_time
+        print(f"✅ Avg time: {avg_time:.4f} seconds")
+
+    # Find best config
+    best_config = min(timings.items(), key=lambda x: x[1])
+    print(f"\n🚀 Best config: batch_size={best_config[0][0]}, block_d={best_config[0][1]} → {best_config[1]:.4f}s avg")
+
+    return best_config[0], timings
+
+
+
+
+    
+
+
+
+
+# def update_cluster_assignments(A,N,D, K, centroids_gpu_tensor, cluster_assignments_tensor):
+#     BATCH_SIZE = 2048 #choose how many vectors N to stream into the GPU at once
+    
+#     #How to split up the 65,536 
+#     BLOCK_D = 128
+    
+#     #How many clusters to batch at a time when we are calculating distances
+#     BLOCK_K = 32
+    
+
+
+#     load_stream = torch.cuda.Stream()
+#     compute_stream = torch.cuda.Stream()
+#     batch_num = triton.cdiv(N, BATCH_SIZE)
+#     batches = [(i * BATCH_SIZE, min((i+1) * BATCH_SIZE, N)) for i in range(batch_num)]
+#     A_gpu_buffers = [torch.empty((batch_size, D), device='cuda') for _ in range(2)]
+#     for i, (start, end) in enumerate(batches):
+#         batch_size = end-start
+#         A_gpu_chunk = A_gpu_buffers[i % 2]  # alternate between 2 buffers
+#         with torch.cuda.stream(load_stream):
+#             #Load the current chunk of A onto the GPU
+            
+#             A_gpu_chunk[:batch_size].copy_(torch.from_numpy(A[start:end]).to('cuda'))
+#             load_event = torch.cuda.Event()
+#             load_event.record(load_stream)
+#         with torch.cuda.stream(compute_stream):
+#             compute_stream.wait_event(load_event)
+#             #One triton program calculates the distance between one point and all K clusters
+#             grid = (batch_size,)
+#             update_cluster_assignments_kernel[grid](A_gpu_chunk,
+#                                               centroids_gpu_tensor,
+#                                               cluster_assignments_tensor,
+#                                               K,
+#                                               D, 
+#                                               start,
+#                                               BLOCK_D,
+#                                               BLOCK_K)
+
+
+
+
+# ################################################################################################################################
+# ################################################################################################################################
+# ################################################################################################################################
+# ################################################################################################################################
+# ################################################################################################################################
+# ################################################################################################################################
+# ################################################################################################################################
+
+
+
+
+
+
+
+
+# def update_centroid_vectors(A, N, D, K,
+#                             centroids_vectors_gpu,
+#                             cluster_assignments):
+    
+    
+#     #DESIGN CHOICE: NEED TO DO IN SUMS AND COUNTS BECAUSE WE ARE STREAMING IN A IN CHUNKS   
+
+#     #Allocate memory for the new vector sums
+#     new_centroids_vector_sums_gpu = torch.zeros_like(centroids_vectors_gpu)
+
+    
+#     #Allocate memory for the new vector counts
+#     new_centroids_vector_counts = torch.zeros(K, dtype = torch.int32,device="cuda")
+#     BATCH_SIZE = 2048 #choose how many vectors N to stream into the GPU at once
+
+
+#     #How to split up the 65,536
+#     BLOCK_D = 128
+
+#     #How to split up the A's
+#     BLOCK_A = 32
+
+#     #Move the cluster_assignments to the cpu
+#     cluster_assignments_cpu = cluster_assignments.cpu()
+
+#     load_stream = torch.cuda.Stream()
+#     compute_stream = torch.cuda.Stream()
+
+#     batch_num = triton.cdiv(N, BATCH_SIZE)
+#     batches = [(i * BATCH_SIZE, min((i+1) * BATCH_SIZE, N)) for i in range(batch_num)]
+
+#     A_gpu_buffers = [torch.empty((BATCH_SIZE, D), device='cuda') for _ in range(2)]
+#     for i, (start, end) in enumerate(batches):
+#         batch_size = end-start
+#         A_gpu_chunk = A_gpu_buffers[i % 2]  # alternate between 2 buffers
+#         with torch.cuda.stream(load_stream):
+#             # 1. Slice current batch of A (this is a CPU numpy array or torch tensor)
+#             A_chunk_cpu = A[start:end]
+
+#             # 2. Slice current chunk of cluster assignments
+#             assignment_chunk = cluster_assignments_cpu[start:end]
+
+#             # 3. Build per-cluster indices
+#             cluster_indices = [[] for _ in range(K)]
+#             for j, k in enumerate(assignment_chunk):
+#                 cluster_indices[k].append(j)
+
+#             # 4. Convert indices to tensors for fancy indexing
+#             cluster_indices = [
+#                 torch.as_tensor(idxs, dtype=torch.long) if idxs else torch.empty(0, dtype=torch.long)
+#                 for idxs in cluster_indices
+#             ]
+
+#             # 5. Reorder rows using the indices
+#             reordered_rows = torch.cat([A_chunk_cpu[idxs] for idxs in cluster_indices], dim=0)
+
+#             # Compute cluster_offsets
+#             offsets = [0]
+#             for rows in cluster_indices:
+#                 offsets.append(offsets[-1] + len(rows))
+
+            
+#             # reordered_rows is already a torch tensor on CPU
+#             A_gpu_chunk[:batch_size].copy_(reordered_rows.to('cuda'))
+
+#             cluster_offsets = torch.tensor(offsets, dtype=torch.int32, device='cuda')
+#             load_event = torch.cuda.Event()
+#             load_stream.record_event(load_event)
+#         with torch.cuda.stream(compute_stream):
+#             compute_stream.wait_event(load_event)
+#             #One triton program calculates the distance between one point and all K clusters
+#             grid = (K,)
+#             update_new_cluster_sum_and_counts_kernel[grid](A_gpu_chunk,
+#                                                             cluster_offsets,
+#                                                             new_centroids_vector_sums_gpu,
+#                                                             new_centroids_vector_counts,
+#                                                             D,
+#                                                             A_gpu_chunk.stride(0),
+#                                                             new_centroids_vector_sums_gpu.stride(0),
+#                                                             BLOCK_A,
+#                                                             BLOCK_D
+#                                                             )
+    
+#     torch.cuda.synchronize()
+#     safe_counts = new_centroids_vector_counts.clamp(min=1)
+#     new_centroid_vectors = new_centroids_vector_sums_gpu / safe_counts[:, None]
+
+#     total_squared_difference = torch.sum((new_centroid_vectors-centroids_vectors_gpu) ** 2)
+
+#     return total_squared_difference, new_centroid_vectors, new_centroids_vector_counts
+
+
+
+
+
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+
+
+    
+            
+
+
+
+
+                
+
+
+
+
+
+
+
 
 def our_kmeans(N, D, A, K):
-    MAX_ITERATIONS = 1_000_000
-    #Randomly initialize the centroids
-    np.random.seed(42)
-    cluster_shape = (N,)
-    #Randomly select K distinct vectors to be the cluster centroids
-    initial_centroids_indices = np.random.choice(N, K, replace=False)
-    centroids = A[initial_centroids_indices]
-    assert centroids.shape == (K, D)
+    kmeans = TritonKMeans(n_clusters=K, verbose=True)
+    kmeans.fit(A)  # A is a (N, D) NumPy array
+    labels = kmeans.predict()
+    print(labels)
 
-    num_iterations = 0
-    convergence_criteria = 0.001
-    #Initialize number of previous cluster changes to K
-    num_previous_cluster_changes = K
-    #Set up a 
-    while num_previous_cluster_changes > 0:
 
-        #Assignment step
-        #in parallel (across the N data points as far as possible) calculate the distance to each centroid
-        #also, the distance to each centroid can also be done in parallel
-        #so we want to launch a N * K kernel that populates an N*K matrix then picks the
-        pass
+    # MAX_ITERATIONS = 1_000_000
+    # #Randomly initialize the centroids
+    # np.random.seed(42)
+    # cluster_shape = (N,)
+    # #Randomly select K distinct vectors to be the cluster centroids
+    # initial_centroids_indices = np.random.choice(N, K, replace=False)
+    # centroids_vectors = A[initial_centroids_indices]
+    # assert centroids_vectors.shape == (K, D)
+
+    # #LOOP WHILE CENTROIDS ARE MOVING SIGNIFICANTLY AND NUM_ITERATIONS > MAX_ITERATIONS  
+
+    # #DESIGN CHOICE:
+    #     #Move the centroids to the GPU and keep them there the whole time
+    # centroids_vectors_gpu = torch.from_numpy(centroids_vectors).to(device="cuda")
+
+    # #DESIGN CHOICE:
+    #     #Keep a torch tensor of size N denoting the cluster assignment of each point on the GPU at all times
+    # #Assume 16 bit integers is fine here if we expect the number of clusters K to be small
+    # cluster_assignments = torch.empty(N, device="cuda", dtype=torch.int32)
+
+    
+    # has_converged = False
+    # reinitialized_last_iter = False
+    # tol = 1e-4
+
+    # for i in range(MAX_ITERATIONS):
+    #     # Step 1: Update cluster assignments (on GPU)
+    #     update_cluster_assignments(A, N, D, K, centroids_vectors_gpu, cluster_assignments)
+
+    #     # Step 2: Wait until cluster assignment is done
+    #     torch.cuda.synchronize()
+
+    #     # Step 3: Update centroids and get movement + new counts
+    #     total_centroid_updates, new_centroids_vectors_gpu, new_centroids_vector_counts = update_centroid_vectors(
+    #         A, N, D, K, centroids_vectors_gpu, cluster_assignments
+    #     )
+
+    #     # Step 4: Handle disappeared centroids
+    #     disappeared = (new_centroids_vector_counts == 0)
+
+    #     if disappeared.any():
+    #         # Reinitialize those centroids to random rows from A
+    #         rand_idxs = torch.randint(0, N, (disappeared.sum().item(),), device='cpu')
+    #         reinit_vectors = torch.from_numpy(A[rand_idxs.numpy()]).to('cuda')
+    #         new_centroids_vectors_gpu[disappeared] = reinit_vectors
+    #         reinitialized_last_iter = True
+    #     else:
+    #         if not reinitialized_last_iter and total_centroid_updates < tol:
+    #             has_converged = True
+    #             break
+    #         reinitialized_last_iter = False
+
+    #     # Step 5: Update centroids for next iteration
+    #     centroids_vectors_gpu = new_centroids_vectors_gpu
+
+    # return centroids_vectors_gpu, cluster_assignments, i, has_converged
+
+        
 
 
 
@@ -1248,6 +1796,34 @@ def test_k_means_l2():
     print(f"Chunked L2 result: {results_chunked}")
 
 
+def my_test_k_means():
+    N = 50000
+    D = 2048
+    A = np.random.rand(N, D).astype(np.float32)
+    K = 10
+    our_kmeans(N,D,A,K)
+
+def test_k_means_configs():
+    A = np.random.randn(30000, 1024).astype(np.float32)
+
+    configs = [
+        (1024, 64),
+        (2048, 64),
+        (1024, 128),
+        (2048, 128),
+        (2048, 256),
+        (8192, 128),
+    ]
+
+    best_config, all_timings = benchmark_kmeans_configs(
+        A_np=A,
+        configs=configs,
+        K=10,
+        max_iter=20,
+        num_trials=3
+    )
+
+
 
 if __name__ == "__main__":
     
@@ -1255,5 +1831,7 @@ if __name__ == "__main__":
     # main()
     # test_row_calculator()
     # test_k_means_l2()
-    test_k_means_l2()
+    # test_k_means_l2()
     # test_cosine_kernel()
+    # my_test_k_means()
+    test_k_means_configs()

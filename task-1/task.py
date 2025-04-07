@@ -627,6 +627,180 @@ def our_kmeans_L2(N, D, A, K):
     # Also return the centroids on the CPU
     return cluster_assignments, centroids_gpu
 
+def our_kmeans_L2_updated(N, D, A, K, number_streams, gpu_batch_number, max_iterations):
+    max_iters = max_iterations
+    tol = 1e-4
+    gpu_batch_num = gpu_batch_number
+    num_streams = number_streams
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    cluster_assignments = cp.empty(N, dtype=np.int32)
+
+    # Initialise GPU centroids
+    np.random.seed(42)
+    indices = np.random.choice(N, K, replace=False)
+    centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
+    # print(f"Centroids gpu data type is {centroids_gpu.dtype}")
+    # print(f"Centroids gpu first 50 elements are {centroids_gpu[:50]}")
+
+    # Preallocate buffers and streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
+    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(num_streams)]
+    assignments_gpu = [cp.empty(gpu_batch_size, dtype=cp.int32) for _ in range(num_streams)]
+
+
+    for j in range(max_iters):
+        print(f"Max iters is {j}")
+        cluster_sums_stream = [cp.zeros((K, D), dtype=cp.float32) for _ in range(num_streams)]
+        counts_stream = [cp.zeros(K, dtype=cp.int32) for _ in range(num_streams)]
+
+
+        #Assign clusters in parallel across streams and write to global buffers (one buffer per stream)
+        #Then compute the cluster sums and counts by summing the global buffers at the end
+        for i, (start, end) in enumerate(gpu_batches):
+            stream = streams[i%num_streams]
+            A_buf = A_device[i%num_streams]
+            assignments_buf = assignments_gpu[i % num_streams]
+            batch_size = end - start
+            with stream:
+                # Async copy
+                A_buf[:batch_size].set(A[start:end])
+
+                A_batch = A_buf[:batch_size]
+
+                # Compute distances
+                A_norm = cp.sum(A_batch ** 2, axis=1, keepdims=True)
+                C_norm = cp.sum(centroids_gpu ** 2, axis=1, keepdims=True).T
+                dot = A_batch @ centroids_gpu.T
+                distances = A_norm + C_norm - 2 * dot
+                # Optional: report tie stats
+                # num_tied = cp.sum(cp.sum(distances == distances.min(axis=1, keepdims=True), axis=1) > 1)
+                # print(f"{num_tied.item()} vectors have ties in this batch")
+
+                # Assign to nearest centroid
+                assignments = cp.argmin(distances, axis=1)
+                #print if there are multiple distances that are the minimum
+                # if cp.any(cp.sum(distances == distances.min(axis=1, keepdims=True), axis=1) > 1):
+                #     print("Multiple distances are the same for some vectors")
+                assignments_buf[:batch_size] = assignments
+                cluster_assignments[start:end] = assignments_buf[:batch_size]
+
+                # Compute per-cluster sum and counts using vectorized one-hot trick
+                one_hot = cp.eye(K, dtype=A_batch.dtype)[assignments]
+                batch_cluster_sum = one_hot.T @ A_batch  # (K, D)
+                batch_counts = cp.bincount(assignments, minlength=K)  # (K,)
+
+                # Accumulate into global buffers
+                cluster_sums_stream[i % num_streams] += batch_cluster_sum
+                counts_stream[i % num_streams] += batch_counts
+
+        cp.cuda.Device().synchronize()
+        cluster_sum = sum(cluster_sums_stream)
+        counts = sum(counts_stream)
+
+        # Detect dead centroids before avoiding division by zero
+        dead_mask = (counts == 0)
+        
+        # Avoid division by zero
+        # Send the counts of vectors in each cluster back to the GPU
+        counts = cp.maximum(counts, 1)
+        # By keeping cluster_sum and counts on the GPU, updated_centroids can be computed on the GPU
+        updated_centroids = cluster_sum / counts[:, None]
+        
+        # Reinitialise dead centroids with random data points
+        if cp.any(dead_mask):
+            num_dead = int(cp.sum(dead_mask).get())
+            reinit_indices = np.random.choice(N, num_dead, replace=False)
+            reinit_centroids = cp.asarray(A[reinit_indices], dtype=cp.float32)
+            updated_centroids[dead_mask] = reinit_centroids
+
+        # Check for convergence
+        shift = cp.linalg.norm(updated_centroids - centroids_gpu)
+        print(f"Shift is {shift}")
+        print(f"Dead centroids: {cp.sum(dead_mask).item()}")
+        if shift < tol:
+            break
+        centroids_gpu = updated_centroids
+    # Return the assignments and the centroids on the CPU
+    return cp.asnumpy(cluster_assignments), cp.asnumpy(centroids_gpu)
+
+def our_k_means_L2_cpu(N, D, A, K):
+    """
+    KMeans clustering on CPU using L2 distance.
+    Parameters:
+        N (int): Number of data points.
+        D (int): Dimensionality of data points.
+        A (numpy.ndarray): Data points.
+        K (int): Number of clusters.
+    Returns:
+        numpy.ndarray: Cluster assignments.
+        numpy.ndarray: Final centroids.
+    """
+    max_iters = 10
+    tol = 1e-4
+
+    cluster_assignments = np.empty(N, dtype=np.int32)
+
+    # Initialise GPU centroids
+    #Reset the random seed for reproducibility
+    np.random.seed(42)
+
+    indices = np.random.choice(N, K, replace=False)
+    centroids = A[indices]
+    print(f"Centroids cpu ddata type is {centroids.dtype}")
+    print(f"Centroids cpu first 50 elements are {centroids[:50]}")
+
+
+    for j in range(max_iters):
+        print(f"Max iters is {j}")
+        A_norm = np.sum(A ** 2, axis=1, keepdims=True)
+        C_norm = np.sum(centroids ** 2, axis=1, keepdims=True).T
+        dot = A @ centroids.T
+        distances_squared = (A_norm + C_norm - 2 * dot)
+        # num_tied = cp.sum(cp.sum(distances_squared == distances_squared.min(axis=1, keepdims=True), axis=1) > 1)
+        # print(f"{num_tied.item()} vectors have ties in this batch")
+
+        # Assign to nearest centroid
+        cluster_assignments = np.argmin(distances_squared, axis=1)
+
+        # Compute new centroids
+        cluster_sum = np.zeros((K, D), dtype=A.dtype)
+        counts = np.zeros(K, dtype=np.int32)
+
+        for i in range(K):
+            members = A[cluster_assignments == i]
+            if len(members) > 0:
+                cluster_sum[i] = members.sum(axis=0)
+                counts[i] = len(members)
+
+
+        # Detect dead centroids before avoiding division by zero
+        dead_mask = (counts == 0)
+        
+        # Avoid division by zero
+        # Send the counts of vectors in each cluster back to the GPU
+        counts = np.maximum(counts, 1)
+        # By keeping cluster_sum and counts on the GPU, updated_centroids can be computed on the GPU
+        updated_centroids = cluster_sum / counts[:, None]
+        
+        # Reinitialise dead centroids with random data points
+        if np.any(dead_mask):
+            num_dead = np.sum(dead_mask)
+            reinit_indices = np.random.choice(N, num_dead, replace=False)
+            updated_centroids[dead_mask] = A[reinit_indices]
+
+        # Check for convergence
+        shift = np.linalg.norm(updated_centroids - centroids)
+        print(f"Shift is {shift}")
+        print(f"Dead centroids: {np.sum(dead_mask).item()}")
+        if shift < tol:
+            break
+        centroids = updated_centroids
+    # Return the assignments and the centroids on the CPU
+    return cluster_assignments, centroids
+
+
 
 def our_kmeans_cosine(N, D, A, K):
     max_iters = 20

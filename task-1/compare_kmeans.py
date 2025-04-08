@@ -8,29 +8,32 @@ import torch
 
 
 
-def test_kmeans_wrapper(func, N, D, A, K, repeat):
+def test_kmeans_time_wrapper(func, N, D, A, K, repeat):
     # Warm up, first run seems to be a lot longer than the subsequent runs
     # result = func(N, D, A, K, number_streams, gpu_batch_number, max_iterations)
-    start = time.time()
+    total_time = 0
     for _ in range(repeat):
+        start = time.time()
         # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         result = func(N, D, A, K)
         cp.cuda.Stream.null.synchronize()
+        end = time.time()
+        elapsed_time = end - start
+        total_time += elapsed_time
         cp.get_default_memory_pool().free_all_blocks()
     # Synchronise to ensure all GPU computations are finished before measuring end time
-    end = time.time()
-    avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
-    print(f"CuPy {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
+    avg_time = (total_time / repeat) * 1000 # Runtime in ms
+    print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
     return avg_time
 
 def my_test_k_means():
     funcs = [
         our_kmeans_L2_updated_no_batching,
         our_kmeans_L2_updated,
-        our_kmeans_L2
+        # our_kmeans_L2
     ]
-    N = 1000000
-    D = 1024
+    N = 6000000
+    D = 512
     A = np.random.rand(N, D).astype(np.float32)
     K = 10
     repeat = 1
@@ -41,7 +44,7 @@ def my_test_k_means():
         torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
         times.append(result)
     for i, time in enumerate(times):
-        print(f"Function {funcs[i].__name__} took {time:.6f} seconds")
+        print(f"Function {funcs[i].__name__} took {time:.6f} milliseconds")
 
 def configure_cupy_batches_and_streams():
     N = 1000000

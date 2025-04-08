@@ -1695,17 +1695,23 @@ def our_ann_cosine(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 
 # Example
-def test_kmeans(func, N, D, A, K, repeat):
-    # Warm up
-    result = func(N, D, A, K)
-    start = time.time()
+def test_kmeans_time_wrapper(func, N, D, A, K, repeat):
+    # Warm up, first run seems to be a lot longer than the subsequent runs
+    # result = func(N, D, A, K, number_streams, gpu_batch_number, max_iterations)
+    total_time = 0
     for _ in range(repeat):
+        start = time.time()
+        # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         result = func(N, D, A, K)
+        cp.cuda.Stream.null.synchronize()
+        end = time.time()
+        elapsed_time = end - start
+        total_time += elapsed_time
+        cp.get_default_memory_pool().free_all_blocks()
     # Synchronise to ensure all GPU computations are finished before measuring end time
-    cp.cuda.Stream.null.synchronize()
-    end = time.time()
-    avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
-    print(f"CuPy {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
+    avg_time = (total_time / repeat) * 1000 # Runtime in ms
+    print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
+    return avg_time
 
 def test_knn(func, N, D, A, X, K, repeat):
     # Warm up, first run seems to be a lot longer than the subsequent runs
@@ -1790,37 +1796,37 @@ def recall_rate(list1, list2):
     """
     return len(set(list1) & set(list2)) / len(list1)
 
-# if __name__ == "__main__":
-#     np.random.seed(42)
-#     N = 1000000
-#     D = 1024
-#     A = np.random.randn(N, D).astype(np.float32)
-#     X = np.random.randn(D).astype(np.float32)
-#     K = 10
-#     repeat = 1
-#     num_clusters = 500
+if __name__ == "__main__":
+    np.random.seed(42)
+    N = 4000000
+    D = 512
+    A = np.random.randn(N, D).astype(np.float32)
+    X = np.random.randn(D).astype(np.float32)
+    K = 10
+    repeat = 1
+    num_clusters = 10
     
-#     # Build index for testing ann and comparing to knn
-#     cluster_assignments, centroids_gpu = our_kmeans_L2(N, D, A, num_clusters)
+    # Build index for testing ann and comparing to knn
+    # cluster_assignments, centroids_gpu = our_kmeans_L2(N, D, A, num_clusters)
 
-#     knn_functions = [our_knn_L2_CUPY]
-#     kmeans_functions = []
-#     # ann_functions = [our_ann_L2_query_only]
-#     # Testing recall
-#     # ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
-#     # knn_result = our_knn_L2_CUPY(N, D, A, X, K)
-#     print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
+    knn_functions = [our_knn_L2_CUPY]
+    kmeans_functions = []
+    # ann_functions = [our_ann_L2_query_only]
+    # Testing recall
+    # ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
+    # knn_result = our_knn_L2_CUPY(N, D, A, X, K)
+    # print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
  
-#     if knn_functions:
-#         for func in knn_functions:
-#             test_knn(func, N, D, A, X, K, repeat)
+    if knn_functions:
+        for func in knn_functions:
+            test_knn(func, N, D, A, X, K, repeat)
     
-#     if kmeans_functions:
-#         for func in kmeans_functions:
-#             test_kmeans(func, N, D, A, num_clusters, repeat)
+    if kmeans_functions:
+        for func in kmeans_functions:
+            test_kmeans(func, N, D, A, num_clusters, repeat)
             
-#     if ann_functions:
-#         for func in ann_functions:
-#             test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
+    # if ann_functions:
+    #     for func in ann_functions:
+    #         test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
 
         

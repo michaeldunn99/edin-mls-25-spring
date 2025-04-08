@@ -265,9 +265,7 @@ def distance_dot_triton_kernel(X_ptr,
     x_dot_y_partial_sum = tl.sum(x * y, axis=0, mask=mask)
 
 
-    #OPTION 1
-    #write each of the partial sums back to DRAM
-    #reduce back in host via (a) regular .sum() calls (b) reducing again in another kernel
+    #DESIGN CHOICE: Write each of the partial sums back to DRAM
     tl.store(X_dot_Y_sum_output_ptr + pid, x_dot_y_partial_sum)
 
 
@@ -300,7 +298,7 @@ def distance_dot_triton(X: torch.Tensor, Y: torch.Tensor):
     #   Use regular PyTorch .sum() method to sum up our partial sums rather than reducing via another kernel launch
     X_dot_Y = X_dot_Y_partial_sums.sum()
 
-    return X_dot_Y
+    return - X_dot_Y
 
 
 ################################################################################################################################
@@ -349,11 +347,14 @@ def distance_l1_triton_kernel(X_ptr,
 
 
 #L1 helper function
-def distance_l1_triton(X: torch.Tensor, Y: torch.Tensor):
+def distance_l1_triton(X, Y: torch.Tensor):
     """
     Helper function to calculate the L2 Distance between two torch tensors on the GPU
     """
     assert X.shape == Y.shape
+
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
     n_elements = X.numel()
     BLOCK_SIZE = 1024
     

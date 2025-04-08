@@ -1,39 +1,34 @@
 import torch
 import cupy as cp
 import triton
+import triton.language as tl
 import numpy as np
 import time
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
+
+DEVICE = torch.device("cuda")
+
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+
 # ------------------------------------------------------------------------------------------------
-# Your Task 1.1 code here
+# SECTION I: DISTANCE FUNCTIONS:
+    # SECTION I A: CUPY DISTANCE FUNCTIONS
+    # SECTION I B: TRITON DISTANCE FUNCTIONS
+    # SECTION I C: TORCH DISTANCE FUNCTIONS   
+    # SECTION I D: CPU (Numpy) DISTANCE FUNCTIONS   
 # ------------------------------------------------------------------------------------------------
 
-# You can create any kernel here
-# def distance_kernel(X, Y, D):
-#     pass
+# ------------------------------------------------------------------------------------------------
+# SECTION I A: CUPY DISTANCE FUNCTIONS   
+# ------------------------------------------------------------------------------------------------
 
-def distance_cosine_CUPY(X, Y):
-    """
-    Compute the cosine distance between two vectors.
-    
-    Parameters:
-    X (cupy.ndarray): First input array (vector) of shape (d,).
-    Y (cupy.ndarray): Second input array (vector) of shape (d,).
-
-    Returns:
-    cupy.ndarray: The cosine distance between the two input vectors.
-    """
-        
-    # Compute dot product
-    dot_product = cp.sum(X*Y)
-
-    # Compute norms
-    norm_x = cp.linalg.norm(X)
-    norm_y = cp.linalg.norm(Y)
-
-    return 1.0 - (dot_product) / (norm_x * norm_y)
-
+# CuPy L2 Distance function
 def distance_l2_CUPY(X, Y):
     """
     Computes the squared Euclidean (L2 squared) distance between two vectors.
@@ -45,8 +40,38 @@ def distance_l2_CUPY(X, Y):
     Returns:
     cupy.ndarray: Squared Euclidean distance between X and Y.
     """
+    # Trasform to cupy array
+    X = cp.asarray(X)
+    Y = cp.asarray(Y)
     return cp.linalg.norm(X - Y)
 
+# CuPy Cosine Distance function
+def distance_cosine_CUPY(X, Y):
+    """
+    Compute the cosine distance between two vectors.
+    
+    Parameters:
+    X (cupy.ndarray): First input array (vector) of shape (d,).
+    Y (cupy.ndarray): Second input array (vector) of shape (d,).
+
+    Returns:
+    cupy.ndarray: The cosine distance between the two input vectors.
+    """
+    # Trasform to cupy array
+    X = cp.asarray(X)
+    Y = cp.asarray(Y)
+    
+    # Compute dot product
+    dot_product = cp.sum(X*Y)
+
+    # Compute norms
+    norm_x = cp.linalg.norm(X)
+    norm_y = cp.linalg.norm(Y)
+
+    return 1.0 - (dot_product) / (norm_x * norm_y)
+
+
+# CuPy Dot Product function
 def distance_dot_CUPY(X, Y):
     """
     Computes the dot product distance between two vectors.
@@ -56,28 +81,552 @@ def distance_dot_CUPY(X, Y):
     Y (cupy.ndarray): Second input vector.
 
     Returns:
-    cupy.ndarray: The negative dot product distance.
+    cupy.ndarray: The dot product distance.
     """
 
-    return -cp.sum(X*Y)
+    #Trasform to cupy array
+    X = cp.asarray(X)
+    Y = cp.asarray(Y)
 
+    return cp.sum(X*Y)
+
+#CuPy Manhattan (L1) Distance function
 def distance_manhattan_CUPY(X, Y):
+
     """
     Computes the Manhattan (L1) distance between two vectors.
 
     Parameters:
-    X (cupy.ndarray): First input vector.
-    Y (cupy.ndarray): Second input vector.
+    X (numpy.ndarray): First input vector.
+    Y (numpy.ndarray): Second input vector.
 
     Returns:
     cupy.ndarray: The Manhattan distance.
     """
+
+    #Trasform to cupy array
+    X = cp.asarray(X)
+    Y = cp.asarray(Y)
+
     return cp.sum(cp.abs(X - Y))
 
 # ------------------------------------------------------------------------------------------------
-# Your Task 1.2 code here
+# SECTION I B: TRITON DISTANCE FUNCTIONS 
 # ------------------------------------------------------------------------------------------------
 
+#Triton kernel used in calculating L2 distance
+
+@triton.jit
+def distance_l2_triton_kernel(X_ptr,
+                              Y_ptr,
+                              X_minus_Y_squared_sum_output_ptr,
+                              n_elements,
+                              BLOCK_SIZE: tl.constexpr,
+                              ):
+    """
+    This kernel calculates the partial sums involved in calculating the l2 distance between two vectors
+    This is a classic 'reduction' technique in GPU programming
+    The calling Python function will then call sum the output and take its square root to get the L2 distance
+    In particular, given vectors X and Y it returns a torch tensor on the GPU of partial sums of (X_i-Yi)^2
+
+    - Args:
+        X_ptr (torch.Tensor): Pointer to the first input vector.
+        Y_ptr (torch.Tensor): Pointer to the second input vector.
+        X_minus_Y_squared_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of (X_i - Y_i)^2.
+        n_elements (int): Number of elements in the input vectors.
+        BLOCK_SIZE (int): Size of the block for parallel processing.
+    
+    - Returns:
+        None: The kernel writes the partial sums to the output tensor.
+        Note: These output tensors are then used in the host function to calculate the final L2 distance.
+    """
+    #1D launch grid so axis is 0
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    #load the elements from GPU DRAM into registers
+    x = tl.load(X_ptr + offsets, mask=mask)
+    y = tl.load(Y_ptr + offsets, mask=mask)
+
+    # Elementwise multiply with mask applied via tl.where
+    #In Theory - these could be done in separate streams
+    x_minus_y = x - y
+    x_minus_y_squared = x_minus_y * x_minus_y
+
+    #Sum each of them to get partial sums
+    x_minus_y_squared_partial_sum = tl.sum(x_minus_y_squared, axis = 0)
+    
+    #OPTION 1
+    #write each of the partial sums back to DRAM
+    #reduce back in host via (a) regular .sum() calls (b) reducing again in another kernel
+    tl.store(X_minus_Y_squared_sum_output_ptr + pid, x_minus_y_squared_partial_sum)
+
+
+
+#Triton L2 helper function
+def distance_l2_triton(X, Y):
+    """
+    Helper function to calculate the L2 Distance between two torch tensors on the GPU
+    Args:
+        X (numpy.ndarray): First input tensor.
+        Y (numpy.ndarray): Second input tensor.
+    Returns:
+        Scalar: L2 distance between the two input tensors.
+    
+    Note:   This function calls the Triton kernel to compute the partial sums and then calculates the final L2 distance using PyTorch operations.
+    """
+    assert X.shape == Y.shape
+
+    #Convert to torch tensors on the GPU from numpy arrays
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
+
+    n_elements = X.numel()
+    BLOCK_SIZE = 1024
+    
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    X_minus_Y_squared_partial_sums = torch.empty(num_blocks, device=DEVICE, dtype =torch.float32)
+    grid = (num_blocks,)
+
+    #Call the kernel to reduce to partial sums
+    distance_l2_triton_kernel[grid](X,
+                                    Y,
+                                    X_minus_Y_squared_partial_sums,
+                                    n_elements,
+                                    BLOCK_SIZE)
+    #Synchronize here as need to wait for the kernels to write to the output arrays
+    #before we start summing them
+    torch.cuda.synchronize()
+    
+    #Synchronize here as need to wait for the kernels to write to the output arrays
+    #before we start summing them
+    torch.cuda.synchronize()
+
+    #DESIGN CHOICE:
+    #   Use regular PyTorch .sum() method to sum up our partial sums rather than reducing via another kernel launch
+    X_minus_Y_squared = X_minus_Y_squared_partial_sums.sum()
+
+    return torch.sqrt(X_minus_Y_squared)
+
+
+
+#Triton kernel used in calculating cosine distance
+
+@triton.jit
+def distance_cosine_triton_kernel(X_ptr,
+                                  Y_ptr,
+                                  X_dot_X_sum_output_ptr,
+                                  X_dot_Y_sum_output_ptr,
+                                  Y_dot_Y_sum_output_ptr,
+                                  n_elements,
+                                  BLOCK_SIZE: tl.constexpr,
+                                   ):
+    """
+    This kernel calculates the partial sums involved in calculating the cosine distance between two vectors]
+    In particular, given vectors X and Y it returns three torch tensors on the GPU of partial sums
+
+    - Args:
+        X_ptr (torch.Tensor): Pointer to the first input vector.
+        Y_ptr (torch.Tensor): Pointer to the second input vector.
+        X_dot_X_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of X dot X.
+        X_dot_Y_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of X dot Y.
+        Y_dot_Y_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of Y dot Y.
+        n_elements (int): Number of elements in the input vectors.
+        BLOCK_SIZE (int): Size of the block for parallel processing.
+    
+    - Returns:
+        None: The kernel writes the partial sums to the output tensors.
+        Note: These output tensors are then used in the host function to calculate the final cosine distance.
+
+    - DESIGN CHOICE:
+        This kernel uses intra-row paralellism which provides a big speed up when vector dimension is high (>1,000,000)
+        However CuPy is faster when the dimension is 65526 (2^15)
+        Strategy employed here is known as a reduction:
+            - Step A:   Calculating the partials sums X_dot_X, X_dot_Y and Y_dot_Y in parallel
+            - Step B:   Outputting the partial sums to three partial sums vectors to be operated on later to calculate final
+                        cosine distance
+        The kernel is then launched from a host function which handles the final reduction of the partial sums
+    """
+    #1D launch grid so axis is 0
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    #load the elements from GPU DRAM into registers
+    x = tl.load(X_ptr + offsets, mask=mask)
+    y = tl.load(Y_ptr + offsets, mask=mask)
+
+    # Elementwise multiply with mask applied via tl.where
+    #In Theory - these could be done in separate streams
+    x_dot_x = tl.where(mask, x * x, 0)
+    x_dot_y = tl.where(mask, x * y, 0)
+    y_dot_y = tl.where(mask, y * y, 0)
+
+    #Sum each of them to get partial sums
+    x_dot_x_partial_sum = tl.sum(x_dot_x, axis = 0)
+    x_dot_y_partial_sum = tl.sum(x_dot_y, axis = 0)
+    y_dot_y_partial_sum = tl.sum(y_dot_y, axis = 0)
+    
+    #write each of the partial sums back to DRAM
+    #reduce back in host via (a) regular .sum() calls (b) reducing again in another kernel
+    tl.store(X_dot_X_sum_output_ptr + pid, x_dot_x_partial_sum)
+    tl.store(X_dot_Y_sum_output_ptr + pid, x_dot_y_partial_sum)
+    tl.store(Y_dot_Y_sum_output_ptr + pid, y_dot_y_partial_sum)
+
+    #TO DO: OPTION 2
+    #DO TL.ATOMIC ADD (LOOK INTO THIS)
+
+
+
+#Cosine function helper kernel
+def distance_cosine_triton(X, Y):
+    """
+    Helper function to calculate the Cosine Distance between two torch tensors on the GPU
+
+    Args:
+        X (numpy.ndarray): First input tensor.
+        Y (numpy.ndarray): Second input tensor.
+    Returns:
+        Scalar: Cosine distance between the two input tensors.
+    
+    Note:
+        This function calls the Triton kernel to compute the partial sums and then calculates the final cosine distance using PyTorch operations.
+    """
+    assert X.shape == Y.shape
+
+    #Convert to torch tensors on the GPU from numpy arrays
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
+    n_elements = X.numel()
+    BLOCK_SIZE = 1024
+    
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    X_dot_X_partial_sums = torch.empty(num_blocks, device=DEVICE, dtype =torch.float32)
+    X_dot_Y_partial_sums = torch.empty_like(X_dot_X_partial_sums)
+    Y_dot_Y_partial_sums = torch.empty_like(X_dot_X_partial_sums)
+    grid = (num_blocks,)
+
+    distance_cosine_triton_kernel[grid](X,
+                                        Y,
+                                        X_dot_X_partial_sums, 
+                                        X_dot_Y_partial_sums, 
+                                        Y_dot_Y_partial_sums,
+                                        n_elements,
+                                        BLOCK_SIZE)
+    #Synchronize here as need to wait for the kernels to write to the output array before we start summing them
+    torch.cuda.synchronize()
+
+    #DESIGN CHOICE:
+    #   Use regular PyTorch .sum() method to sum up our partial sums rather than reducing via another kernel launch
+    X_dot_X = X_dot_X_partial_sums.sum()
+    X_dot_Y = X_dot_Y_partial_sums.sum()
+    Y_dot_Y = Y_dot_Y_partial_sums.sum()
+
+    return 1 - (X_dot_Y / (torch.sqrt(X_dot_X *Y_dot_Y)))
+
+
+#Dot Product kernel used to calculate dot product between two vectors
+@triton.jit
+def distance_dot_triton_kernel(X_ptr,
+                              Y_ptr,
+                              X_dot_Y_sum_output_ptr,
+                              n_elements,
+                              BLOCK_SIZE: tl.constexpr,
+                              ):
+    """
+    This kernel calculates the partial dot product sums involved in calculating the dot product between two vectors
+    This is a classic 'reduction' technique in GPU programming: we split the dot product into smaller chunks and work on them in parallel then combine the results
+    once everything is done: the calling Python function will then call sum the output to get the final dot product
+
+    Args:
+        X_ptr (torch.Tensor): Pointer to the first input vector.
+        Y_ptr (torch.Tensor): Pointer to the second input vector.
+        X_dot_Y_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of X dot Y.
+        n_elements (int): Number of elements in the input vectors.
+        BLOCK_SIZE (int): Size of the block for parallel processing.
+
+    """
+    #1D launch grid so axis is 0
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    #load the elements from GPU DRAM into registers
+    x = tl.load(X_ptr + offsets, mask=mask)
+    y = tl.load(Y_ptr + offsets, mask=mask)
+
+    # Elementwise multiply with mask applied via tl.where
+    x_dot_y_partial_sum = tl.sum(x * y, axis=0)
+
+
+    #DESIGN CHOICE: Write each of the partial sums back to DRAM
+    tl.store(X_dot_Y_sum_output_ptr + pid, x_dot_y_partial_sum)
+
+
+#Helper function to calculate the dot product between two torch tensors on the GPU - this calls the dot product Triton kernel
+def distance_dot_triton(X, Y):
+    """
+    Helper function to calculate the dot product between two torch tensors on the GPU
+
+    Args:
+        X (numpy.ndarray): First input tensor.
+        Y (numpy.ndarray): Second input tensor.
+    Returns:
+        Scalar: Dot product between the two input tensors.
+    
+    Note: This function calls the Triton kernel to compute the partial sums and then calculates the final dot product using PyTorch operations on the GPU
+    """
+    assert X.shape == Y.shape
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
+    n_elements = X.numel()
+    BLOCK_SIZE = 1024
+    
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    X_dot_Y_partial_sums = torch.empty(num_blocks, device=DEVICE, dtype=torch.float32)
+    grid = (num_blocks,)
+
+    #Call the kernel to reduce to partial sums
+    distance_dot_triton_kernel[grid](X,
+                                    Y,
+                                    X_dot_Y_partial_sums, 
+                                    n_elements,
+                                    BLOCK_SIZE)
+    #Synchronize here as need to wait for the kernels to write to the output arrays
+    #before we start summing them
+    torch.cuda.synchronize()
+
+
+    #DESIGN CHOICE:
+    #   Use regular PyTorch .sum() method to sum up our partial sums rather than reducing via another kernel launch
+    X_dot_Y = X_dot_Y_partial_sums.sum()
+
+    return -X_dot_Y
+
+#L1 norm kernel: This is used to calculate the L1 distance between two vectors
+@triton.jit
+def distance_l1_triton_kernel(X_ptr,
+                              Y_ptr,
+                              X_minus_Y_abs_sum_output_ptr,
+                              n_elements,
+                              BLOCK_SIZE: tl.constexpr,
+                              ):
+    """
+    This kernel calculates the partial sums involved in calculating the L1 distance between two vectors
+    This is a classic 'reduction' technique in GPU programming: we split the L1 distance into smaller chunks and work on them in parallel then combine the results
+    once everything is done: the calling Python function will then call sum the output to get the final L1 distance
+    - Args:
+        X_ptr (torch.Tensor): Pointer to the first input vector.
+        Y_ptr (torch.Tensor): Pointer to the second input vector.
+        X_minus_Y_abs_sum_output_ptr (torch.Tensor): Pointer to the output tensor for the partial sum of |X - Y|.
+        n_elements (int): Number of elements in the input vectors.
+        BLOCK_SIZE (int): Size of the block for parallel processing.
+    
+    - Returns:
+        None: The kernel writes the partial sums to the output tensor.
+    
+    """
+    #1D launch grid so axis is 0
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    #load the elements from GPU DRAM into registers
+    x = tl.load(X_ptr + offsets, mask=mask)
+    y = tl.load(Y_ptr + offsets, mask=mask)
+
+    # Elementwise multiply with mask applied via tl.where
+    #In Theory - these could be done in separate streams
+    x_minus_y_norm = tl.abs(x - y)
+
+    #Sum each of them to get partial sums
+    x_minus_y_abs_partial_sum = tl.sum(x_minus_y_norm, axis = 0)
+    
+    #DESIGN CHOICE: Write each of the partial sums back to DRAM
+    tl.store(X_minus_Y_abs_sum_output_ptr + pid, x_minus_y_abs_partial_sum)
+
+
+
+#L1 helper function: Calls the L1 norm kernel to calculate the L1 distance between two vectors
+def distance_l1_triton(X, Y):
+    """
+    Helper function to calculate the L2 Distance between two torch tensors on the GPU
+    """
+    assert X.shape == Y.shape
+    #Convert the numpy arrays to torch tensors on the GPU
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
+
+    n_elements = X.numel()
+    BLOCK_SIZE = 1024
+    
+    num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+    
+    X_minus_Y_abs_partial_sums = torch.empty(num_blocks, device=DEVICE, dtype =torch.float32)
+    grid = (num_blocks,)
+
+    #Call the kernel to reduce to partial sums
+    distance_l1_triton_kernel[grid](X,
+                                        Y,
+                                        X_minus_Y_abs_partial_sums, 
+                                        n_elements,
+                                        BLOCK_SIZE)
+    #Synchronize here as need to wait for the kernels to write to the output arrays
+    #before we start summing them
+    torch.cuda.synchronize()
+
+
+    #DESIGN CHOICE:
+    #   Use regular PyTorch .sum() method to sum up our partial sums rather than reducing via another kernel launch
+    X_minus_Y_abs = X_minus_Y_abs_partial_sums.sum()
+
+    return X_minus_Y_abs
+
+
+# ------------------------------------------------------------------------------------------------
+# SECTION I C: Torch DISTANCE FUNCTIONS   
+# ------------------------------------------------------------------------------------------------
+
+#Torch L2 Distance function
+# ****** SACHIN INSERT CODE HERE ********
+
+#Torch Cosine Distance function
+# ****** SACHIN INSERT CODE HERE ********
+
+#Torch Dot Product function
+# ****** SACHIN INSERT CODE HERE ********
+
+#Torch Manhattan (L1) Distance function
+
+# ****** SACHIN INSERT CODE HERE ********
+
+
+# ------------------------------------------------------------------------------------------------
+# SECTION I D: CPU DISTANCE FUNCTIONS   
+# ------------------------------------------------------------------------------------------------
+
+def distance_l2_cpu(X, Y):
+    """
+    Computes the squared Euclidean (L2 squared) distance between two vectors.
+
+    Parameters:
+    X (numpy.ndarray): First input vector.
+    Y (numpy.ndarray): Second input vector.
+
+    Returns:
+    numpy.ndarray: Squared Euclidean distance between X and Y.
+    """
+    return np.linalg.norm(X - Y)
+
+def distance_cosine_cpu(X, Y):
+    """
+    Compute the cosine distance between two vectors.
+    
+    Parameters:
+    X (numpy.ndarray): First input array (vector) of shape (d,).
+    Y (numpy.ndarray): Second input array (vector) of shape (d,).
+
+    Returns:
+    numpy.ndarray: The cosine distance between the two input vectors.
+    """
+        
+    # Compute dot product
+    dot_product = np.sum(X*Y)
+
+    # Compute norms
+    norm_x = np.linalg.norm(X)
+    norm_y = np.linalg.norm(Y)
+
+    return 1.0 - (dot_product) / (norm_x * norm_y)  
+
+def distance_dot_cpu(X, Y):
+    """
+    Computes the dot product distance between two vectors.
+
+    Parameters:
+    X (numpy.ndarray): First input vector.
+    Y (numpy.ndarray): Second input vector.
+
+    Returns:
+    numpy.ndarray: The negative dot product.
+    """
+    answer = - np.sum(X*Y)
+
+    return answer
+
+def distance_manhattan_cpu(X, Y):
+    """
+    Computes the Manhattan (L1) distance between two vectors.
+
+    Parameters:
+    X (numpy.ndarray): First input vector.
+    Y (numpy.ndarray): Second input vector.
+
+    Returns:
+    numpy.ndarray: The Manhattan distance.
+    """
+
+    answer = np.sum(np.abs(X - Y))
+    return answer
+
+################################################################################################################################
+
+#Testing Distance Wrapper
+
+def test_distance_wrapper(func, X, Y, repeat=10):
+    """
+    Wrapper function to test distance functions.
+    
+    Parameters:
+    func (function): The distance function to test.
+    X (numpy.ndarray or torch.Tensor): First input vector.
+    Y (numpy.ndarray or torch.Tensor): Second input vector.
+
+    Returns:
+    tuple: A tuple containing the function name, result, and average time taken for the distance calculation.
+    """
+    
+    
+    #Warm up
+    result = func(X, Y)
+    torch.cuda.synchronize()
+
+    start = time.time()
+    for _ in range(repeat):
+        result = func(X, Y)
+        torch.cuda.synchronize()  # Ensure all GPU computations are finished
+    end = time.time()
+    avg_time = ((end - start) / repeat) * 1000  # Runtime in ms
+    print(f"Distance Function: {func.__name__}, Result: {result}, Time: {avg_time:.6f} milliseconds.")
+
+    return func.__name__, result, avg_time
+
+
+
+
+
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+################################################################################################################################
+
+# ------------------------------------------------------------------------------------------------
+# SECTION II: KNN FUNCTIONS   
+# ------------------------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------------------------
+# SECTION II B: CUDA KNN FUNCTIONS 
+# ------------------------------------------------------------------------------------------------
 top_k_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void top_k_kernel(const float* distances, float* topk_values, int* topk_indices, int N, int K) {

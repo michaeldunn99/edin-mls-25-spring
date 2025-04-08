@@ -594,7 +594,7 @@ def l2_distance_triton_kernel_2d(A_ptr,
     #1D launch grid so axis = 0
     #This determines which row we are working on
     offsets = tl.arange(0, BLOCK_SIZE)
-    blocks_in_row = triton.cdiv(n_columns, BLOCK_SIZE)
+    blocks_in_row = tl.cdiv(n_columns, BLOCK_SIZE)
     
     #DESIGN CHOICE: One block deals with one row by looping over in batches of 1024 until have covered
     #               every column
@@ -654,7 +654,7 @@ def manually_sum_and_sqrt_partial_sums(
 
 
 
-def our_knn_l2(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
+def our_knn_l2_triton(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     """
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
@@ -726,7 +726,7 @@ def our_knn_l2(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     topk_values, topk_indices = l2_distances.topk(k=K, largest=False, sorted=True)
     return topk_indices.cpu().numpy()
 
-def our_knn_l2_updated(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
+def our_knn_l2_triton_updated(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     """
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
@@ -800,7 +800,7 @@ def our_knn_l2_updated(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     topk_values, topk_indices = l2_distances.topk(k=K, largest=False, sorted=True)
     return topk_indices.cpu().numpy()
 
-def our_knn_l2_updated_manual_sum(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
+def our_knn_l2_triton_updated_manual_sum(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     """
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
@@ -1535,12 +1535,12 @@ def test_k_nn_l2():
     time.sleep(10)
 
     #warm up updated
-    result_updated_l2 = our_knn_l2_updated(N, D, A, X, K)
+    result_updated_l2 = our_knn_l2_triton_updated(N, D, A, X, K)
     total_time_updated_l2 = 0
     for _ in range(repeat):
         torch.cuda.synchronize() 
         start_updated_l2 = time.time()
-        result_updated_l2 = our_knn_l2_updated(N, D, A, X, K)
+        result_updated_l2 = our_knn_l2_triton_updated(N, D, A, X, K)
         torch.cuda.synchronize()
         end_updated_l2 = time.time()
         time_with_updated_l2 = end_updated_l2 - start_updated_l2
@@ -1553,12 +1553,12 @@ def test_k_nn_l2():
     time.sleep(10)
 
     #warm up updated manual sum
-    result_updated_l2_manual_sum = our_knn_l2_updated_manual_sum(N, D, A, X, K)
+    result_updated_l2_manual_sum = our_knn_l2_triton_updated_manual_sum(N, D, A, X, K)
     total_time_updated_l2_manual_sum = 0
     for _ in range(repeat):
         torch.cuda.synchronize() 
         start_updated_l2_manual_sum = time.time()
-        result_updated_l2_manual_sum = our_knn_l2_updated_manual_sum(N, D, A, X, K)
+        result_updated_l2_manual_sum = our_knn_l2_triton_updated_manual_sum(N, D, A, X, K)
         torch.cuda.synchronize()
         end_updated_l2_manual_sum = time.time()
         time_with_updated_l2_manual_sum = end_updated_l2_manual_sum - start_updated_l2_manual_sum

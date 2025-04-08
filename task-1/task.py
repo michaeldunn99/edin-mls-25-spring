@@ -401,6 +401,55 @@ def our_knn_L2_CUPY(N, D, A, X, K):
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
     return cp.asnumpy(sorted_top_k_indices)
 
+def our_knn_L2_CUPY_updated(N, D, A, X, K, batch_number=32, stream_number=4):
+    gpu_batch_num = batch_number
+    stream_num = stream_number
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+    # final_distances_streams = [cp.zeros(N, dtype=cp.float32) for _ in range(stream_num)]
+
+    # Create multiple CUDA streams
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(stream_number)]
+    # Check if A is already on GPU
+    A_is_gpu = isinstance(A, cp.ndarray)
+    # Move query vector X to GPU once (shared across all streams)
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+
+    # Preallocate device memory for batches
+    if not A_is_gpu:
+        A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(stream_num)]
+    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(stream_num)]
+
+    # Preallocate final distance array
+    final_distances = cp.empty(N, dtype=cp.float32)
+
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i % stream_num]
+        A_buf = A_device[i % stream_num]
+        # D_buf = D_device[i % stream_num]
+        batch_size = end - start
+        with stream:
+            # If A is already on the GPU, slice it directly
+            if A_is_gpu:
+                A_batch = A[start:end]
+            else:
+                # Async copy: Host to preallocated device buffer
+                A_buf[:batch_size].set(A[start:end])
+                A_batch = A_buf[:batch_size]
+            # Compute L2 distance: norm(A[i] - X)
+            # D_buf[:batch_size] = cp.linalg.norm(A_batch - X_gpu, axis=1)
+            # Store result in final array
+            # final_distances_streams[i%stream_num][start:end] = D_device[i][:batch_size]
+            final_distances[start:end] = cp.linalg.norm(A_batch - X_gpu, axis=1)
+
+    # Wait for all streams to finish
+    cp.cuda.Stream.null.synchronize()
+
+    # Top-K selection on GPU
+    top_k_indices = cp.argpartition(final_distances, K)[:K]
+    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+    return cp.asnumpy(sorted_top_k_indices)
+
 
 def our_knn_cosine_CUPY(N, D, A, X, K):
     A_is_gpu = isinstance(A, cp.ndarray)
@@ -526,6 +575,11 @@ def our_knn_L1_CUPY(N, D, A, X, K):
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
 
     return cp.asnumpy(sorted_top_k_indices)
+
+def our_knn_cpu(N, D, A, X, K):
+    distances = np.linalg.norm(A - X, axis=1)
+    return np.argsort(distances)[:K]
+    
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.1 code here

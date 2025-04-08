@@ -35,7 +35,7 @@ def configure_cupy_batches_and_streams():
 
 
 def my_test_k_means():
-    N = 1000000
+    N = 2000000
     D = 1024
     A = np.random.rand(N, D).astype(np.float32)
     K = 10
@@ -45,7 +45,7 @@ def my_test_k_means():
     
     start = time.time()
     # triton_kmeans = TritonKMeans(n_clusters=K, verbose=True)
-    alt_result = our_kmeans_L2_updated(N, D, A, K)
+    alt_result = our_kmeans_L2_updated(N, D, A, K, number_streams=num_streams, gpu_batch_number=gpu_assignments, max_iterations=max_iterations)
     # triton_kmeans.fit(A)  # A is a (N, D) NumPy array
     # labels = triton_kmeans.predict()
     cp.cuda.Stream.null.synchronize()
@@ -71,5 +71,5 @@ def my_test_k_means():
         print(f"There is disagreement at indices: {np.where(gpu_assignments != cpu_assignments)}")    
 
 if __name__ == "__main__":
-    # my_test_k_means()
-    configure_cupy_batches_and_streams()
+    my_test_k_means()
+    # configure_cupy_batches_and_streams()

@@ -406,21 +406,19 @@ def cosine_distance_triton_kernel_2d(A_ptr,
                                   X_dot_X_value,
                                   rows_prior_to_kernel: int,
                                    ):
+    """
+    This kernel calculates the cosine distance between a row of A and X
+    In particular, given vectors A and X it returns a torch tensor on the GPU of cosine distances
 
-
-    #DESIGN THOUGHT:
-    #   Interesting to look into whether we should have intra-row parallelism
-    #       - For 65,000 dimensional rows this doesnt seem necessary
-    #       - However, for 1,000,000 dimensional rows, as we saw above, intra-row parallelism provided a large speed increase
-
-
-    #Here, we only have inter-row parallelismn: We  launch a 1d kernel with block size 1024 and loop through that (if necessary), until have calculated the 
-    #distance between the row in A and X
-    #   (if the row dimension is higher than the block size we just loop within the block)
-    #   This looping is not fully parallel but because we have so many rows anyway, we will still be at maximum GPU capacity at all times I would assume
-    #
-    # An alternative, approach would involve both inter and intra row paralleism: we create a 2d kernel and compute partial sums and then combine these partial sums
-    #however, for 65,000 dimensions is doesn't really justify intra-row parallelism (and also we have many rows)
+    Args:
+        A_ptr: Pointer to the A matrix on the GPU
+        X_ptr: Pointer to the X vector on the GPU
+        cosine_distance_output_ptr: Pointer to the output vector on the GPU
+        n_columns: Number of columns in the A matrix
+        BLOCK_SIZE: Size of the blocks to be used in the kernel
+        X_dot_X_value: Precomputed value of X dot X
+        rows_prior_to_kernel: Number of rows processed before this kernel
+    """
 
     row_pid = tl.program_id(axis=0) #block row index
 
@@ -433,10 +431,7 @@ def cosine_distance_triton_kernel_2d(A_ptr,
     offsets = tl.arange(0, BLOCK_SIZE)
     blocks_in_row = tl.cdiv(n_columns, BLOCK_SIZE)
     
-    #DESIGN CHOICE: One block deals with one row by looping over in batches of 1024 until have covered
-    #               every column
-    #               Alternatively, we can parallelise over rows (reduce) then sum 
-    #               But this is more complex and is unlikely to lead to any time savings when D=65,000 max
+    #DESIGN CHOICE: One block deals with one row by looping over in batches of 512 until have covered every column
 
     for block in range(blocks_in_row):
         column_offsets = block * BLOCK_SIZE + offsets
@@ -467,40 +462,31 @@ def our_knn_cosine(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
     """
-    BLOCK_SIZE = 1024
-    num_rows_per_kernel = max_batch_size_for_triton(D, BLOCK_SIZE)
+
+    #Block size chosen because it is the maximum size of a warp
+    BLOCK_SIZE = 512
+
+    #Number of rows chosen through manual tuning
+    num_rows_per_kernel = 100_000
 
     number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
     
-    ##############3
-    #DESIGN CHOICE:
-    #X is the singular vector being search 
-    #This is one vector - do we just calculate its size straight away and pass to the kernel function
-    ##############3
-    
     X_gpu = torch.from_numpy(X).to(device='cuda')
+
+    #Precompute the value of X dot X
     X_dot_X_value = (X_gpu * X_gpu).sum()
     cosine_distances = torch.empty(N, dtype=torch.float32, device=DEVICE)
 
-    #Launch kernels in groups so as not over memory overload by loading
-    #too many rows on the GPU 
+    #Launch kernels in groups so as not over memory overload by loading too many rows on the GPU 
     rows_prior_to_kernel = 0
+
+    #Loop through the number of kernels we need to launch which is decided as a result of chunking A
     for kernel in range(number_kernels_to_launch):
-            
-            
-
-            #############
-            #DESIGN CHOICE/QUESTION:
-            #Can we speed this part up by streaming?
-            #############
-
-
-            #Load current slice of A onto the GPU from the GPU
             upper_bound = min((kernel+1)*num_rows_per_kernel, N)
             lower_bound = kernel*num_rows_per_kernel
-            # print(f"Upper bound: {upper_bound}")
-            # print(f"Lower bound: {lower_bound}")
             num_rows_per_kernel = upper_bound - lower_bound
+
+            #Load current slice of A onto the GPU from the GPU
             current_A_slice = torch.from_numpy(A[lower_bound:upper_bound]).to(device='cuda')
             #Call kernel to calculate the cosine distance between X and the rows of A
             #1D grid consisting of all the rows we are working on
@@ -513,20 +499,18 @@ def our_knn_cosine(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
                                                    BLOCK_SIZE=BLOCK_SIZE,
                                                    X_dot_X_value=X_dot_X_value,
                                                    rows_prior_to_kernel=rows_prior_to_kernel)
-            #Make sure GPU has finished before getting next slice
+            #Make sure GPU has finished processing before getting next slice
             torch.cuda.synchronize()
             rows_prior_to_kernel += num_rows_per_kernel
-            # print(f"Rows prior to kernel: {rows_prior_to_kernel}")
 
     #Result is a vector on the GPU (cosine distances) with the cosine distance from X to every row
     #in A
     
     #Now we just sort the cosine distances array by index and return the top K values
 
-    #DESIGN CHOICE: SORT THE 4M VECTORS ON THE GPU AFTER FINISHING using PyTorch topk function
+        #DESIGN CHOICE: SORT THE 4M VECTORS ON THE GPU AFTER FINISHING using PyTorch topk function
     torch.cuda.synchronize()
     topk_values, topk_indices = cosine_distances.topk(k=K, largest=False, sorted=True)
-    # print(len(cosine_distances))
     return topk_indices.cpu().numpy()
 
 
@@ -537,7 +521,7 @@ def our_knn_cosine(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
 ################################################################################################################################
 ################################################################################################################################
 @triton.jit
-def l2_distance_triton_kernel_2d_updated(A_ptr,
+def our_knn_l2_triton_kernel_updated(A_ptr,
                                   X_ptr,
                                   l2_distance_partial_sum_output_ptr,
                                   n_columns: int,
@@ -578,7 +562,7 @@ def l2_distance_triton_kernel_2d_updated(A_ptr,
     tl.store(l2_distance_partial_sum_output_ptr + rows_prior_to_kernel*blocks_per_row + row_pid*blocks_per_row + column_pid, 
              A_minus_X_squared_sum)
 @triton.jit
-def l2_distance_triton_kernel_2d(A_ptr,
+def our_knn_l2_triton_kernel(A_ptr,
                                   X_ptr,
                                   l2_distance_output_ptr,
                                   n_columns: int,
@@ -660,13 +644,12 @@ def our_knn_l2_triton(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
     """
-    BLOCK_SIZE = 1024
-    # num_rows_per_kernel = max_batch_size_for_triton(D, BLOCK_SIZE)
-    num_rows_per_kernel = 30000
-    # print(f"Max num rows per kernel: {num_rows_per_kernel}")
+    #Block size is the number of elements in a row - 
+    BLOCK_SIZE = 512
+
+    num_rows_per_kernel = 100_000
 
     number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
-    # print(f"Number of kernels to launch: {number_kernels_to_launch}")
     
     ##############
     #DESIGN CHOICE:
@@ -703,7 +686,7 @@ def our_knn_l2_triton(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
             #1D grid consisting of all the rows we are working on
             grid = (num_rows_per_kernel,)
             # print(f"Grid: {grid}")
-            l2_distance_triton_kernel_2d[grid](current_A_slice,
+            our_knn_l2_triton_kernel[grid](current_A_slice,
                                                    X_gpu,
                                                    l2_distances,
                                                    n_columns=D,
@@ -712,10 +695,6 @@ def our_knn_l2_triton(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K: int):
             #Make sure GPU has finished before getting next slice
             torch.cuda.synchronize()
             rows_prior_to_kernel += num_rows_per_kernel
-                    # Free memory explicitly
-            del current_A_slice
-            torch.cuda.empty_cache()
-            # print(f"Rows prior to kernel: {rows_prior_to_kernel}")
 
     #Result is a vector on the GPU (cosine distances) with the cosine distance from X to every row
     #in A
@@ -732,12 +711,13 @@ def our_knn_l2_triton_updated(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K:
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
     """
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 512
     # num_rows_per_kernel = max_batch_size_for_triton(D, BLOCK_SIZE)
-    num_rows_per_kernel = 30000
+    num_rows_per_kernel = 4_000_000
     # print(f"Max num rows per kernel: {num_rows_per_kernel}")
 
-    number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
+    # number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
+    number_kernels_to_launch = 1
     # print(f"Number of kernels to launch: {number_kernels_to_launch}")
     
     ##############
@@ -774,7 +754,7 @@ def our_knn_l2_triton_updated(N: int, D: int, A: npt.NDArray, X: npt.NDArray, K:
             #1D grid consisting of all the rows we are working on
             grid = (num_rows_per_kernel,blocks_per_row)
             # print(f"Grid: {grid}")
-            l2_distance_triton_kernel_2d_updated[grid](current_A_slice,
+            our_knn_l2_triton_kernel_updated[grid](current_A_slice,
                                                    X_gpu,
                                                    l2_distances_partial_sums,
                                                    n_columns=D,
@@ -806,9 +786,9 @@ def our_knn_l2_triton_updated_manual_sum(N: int, D: int, A: npt.NDArray, X: npt.
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
     """
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 512
     # num_rows_per_kernel = max_batch_size_for_triton(D, BLOCK_SIZE)
-    num_rows_per_kernel = 30000
+    num_rows_per_kernel = 100_000
     # print(f"Max num rows per kernel: {num_rows_per_kernel}")
 
     number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
@@ -849,7 +829,7 @@ def our_knn_l2_triton_updated_manual_sum(N: int, D: int, A: npt.NDArray, X: npt.
             #1D grid consisting of all the rows we are working on
             grid = (num_rows_per_kernel,blocks_per_row)
             # print(f"Grid: {grid}")
-            l2_distance_triton_kernel_2d_updated[grid](current_A_slice,
+            our_l2_distance_triton_kernel_updated[grid](current_A_slice,
                                                    X_gpu,
                                                    l2_distances_partial_sums,
                                                    n_columns=D,
@@ -1509,89 +1489,36 @@ def test_row_calculator():
     BLOCK_SIZE = 1024
     max_rows = max_batch_size_for_triton(D, BLOCK_SIZE)
 
-def test_k_nn_l2():
+def test_knn_wrapper(func, N, D, A, X, K, repeat):
+    # Warm up, first run seems to be a lot longer than the subsequent runs
+    result = func(N, D, A, X, K)
+    torch.cuda.synchronize()
+    print(f"Running {func.__name__} with {N} vectors of dimension {D} and K={K} for {repeat} times.")
+    start = time.time()
+    for _ in range(repeat):
+        # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
+        result = func(N, D, A, X, K)
+        #Ensure one function has completed before starting the next in the loop
+        torch.cuda.synchronize()
+    # Synchronise to ensure all GPU computations are finished before measuring end time
+    end = time.time()
+    avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
+    print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
+    return func.__name__, result, avg_time
+
+def test_knn():
     np.random.seed(67)
-    N = 50_000
-    D = 65536
+    N = 4_000_000
+    D = 512
     A = np.random.rand(N, D).astype(np.float32)
     X = np.random.rand(D).astype(np.float32)
     K = 10
-    repeat = 25
+    repeat = 10
     #warm up regular
-    result = our_knn_l2(N, D, A, X, K)
-    total_time_with_regular_l2 = 0
-    for _ in range(repeat):
-        torch.cuda.synchronize() 
-        start_torch = time.time()
-        result = our_knn_l2(N, D, A, X, K)
-        torch.cuda.synchronize()
-        end_torch = time.time()
-        time_with_regular_l2 = end_torch - start_torch
-        total_time_with_regular_l2 += time_with_regular_l2
-    average_time_with_regular_l2 = total_time_with_regular_l2 / repeat
-    print(f"With regular L2 computation took {(average_time_with_regular_l2) * 1000:.6f} ms.")
-    print(f"Regular L2 result: {result}")
-    #wait for 10 seconds
-    print("Finished running original l2")
-    time.sleep(10)
-
-    #warm up updated
-    result_updated_l2 = our_knn_l2_triton_updated(N, D, A, X, K)
-    total_time_updated_l2 = 0
-    for _ in range(repeat):
-        torch.cuda.synchronize() 
-        start_updated_l2 = time.time()
-        result_updated_l2 = our_knn_l2_triton_updated(N, D, A, X, K)
-        torch.cuda.synchronize()
-        end_updated_l2 = time.time()
-        time_with_updated_l2 = end_updated_l2 - start_updated_l2
-        total_time_updated_l2 += time_with_updated_l2
-    average_time_with_updated_l2 = total_time_updated_l2 / repeat
-    print(f"With updated L2 computation took {(average_time_with_updated_l2) * 1000:.6f} ms.")
-    print(f"Updated L2 result: {result_updated_l2}")
-    #wait for 10 seconds
-    print("Finished running updated l2")
-    time.sleep(10)
-
-    #warm up updated manual sum
-    result_updated_l2_manual_sum = our_knn_l2_triton_updated_manual_sum(N, D, A, X, K)
-    total_time_updated_l2_manual_sum = 0
-    for _ in range(repeat):
-        torch.cuda.synchronize() 
-        start_updated_l2_manual_sum = time.time()
-        result_updated_l2_manual_sum = our_knn_l2_triton_updated_manual_sum(N, D, A, X, K)
-        torch.cuda.synchronize()
-        end_updated_l2_manual_sum = time.time()
-        time_with_updated_l2_manual_sum = end_updated_l2_manual_sum - start_updated_l2_manual_sum
-        total_time_updated_l2_manual_sum += time_with_updated_l2_manual_sum
-    average_time_with_updated_l2_manual_sum = total_time_updated_l2_manual_sum / repeat
-    print(f"With updated manual sum L2 computation took {(average_time_with_updated_l2_manual_sum) * 1000:.6f} ms.")
-    print(f"Updated manual sum L2 result: {result_updated_l2_manual_sum}")
-
-    #wait for 10 seconds
-    time.sleep(10)
-    #warm up the kernel
-    results_chunked = compute_l2_distances_in_chunks(
-        A, X, 
-        chunk_size=30000,  # Process 30000 rows at a time
-        gpu_memory_limit_gb=22  # Assume 22GB GPU memory
-    )
-    total_time_chunked = 0
-    for _ in range(repeat):
-        torch.cuda.synchronize() 
-        start_chunked = time.time()
-        results_chunked = compute_l2_distances_in_chunks(
-            A, X, 
-            chunk_size=30000,  # Process 30000 rows at a time
-            gpu_memory_limit_gb=22  # Assume 22GB GPU memory
-        )
-        torch.cuda.synchronize()
-        end_chunked = time.time()
-        time_with_chunked = end_chunked - start_chunked
-        total_time_chunked += time_with_chunked
-    average_time_with_chunked = total_time_chunked / repeat
-    print(f"With chunked L2 computation took {(average_time_with_chunked) * 1000:.6f} ms.")
-    print(f"Chunked L2 result: {results_chunked}")
+    funcs = [our_knn_l2_triton, our_knn_l2_triton_updated, our_knn_l2_triton_updated_manual_sum]
+    for func in funcs:
+        time = test_knn_wrapper(func, N, D, A, X, K, repeat)
+        print(f"{func.__name__} - Result: {time}")
 
 
 def my_test_k_means():
@@ -1628,7 +1555,7 @@ if __name__ == "__main__":
     # test_kmeans()
     # main()
     # test_row_calculator()
-    # test_k_nn_l2()
+    test_knn()
     # test_cosine_kernel()
-    my_test_k_means()
+    # my_test_k_means()
     # test_k_means_configs()

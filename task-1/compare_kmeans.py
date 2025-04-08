@@ -40,7 +40,7 @@ def my_test_k_means():
     times = []
     for func in funcs:
         print(f"Testing function: {func.__name__}")
-        result = test_kmeans_wrapper(func, N, D, A, K, repeat=repeat)
+        result = test_kmeans_time_wrapper(func, N, D, A, K, repeat=repeat)
         torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
         times.append(result)
     for i, time in enumerate(times):

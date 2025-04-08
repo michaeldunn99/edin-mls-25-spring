@@ -9,16 +9,20 @@ from typing import List
 
 # --- Logical endpoints mapped to actual URLs ---
 TARGET_ENDPOINTS = {
-    "original": "http://localhost:8001/rag",
+    "original": "http://localhost:8000/rag",
     "load_balancer_round_robin": "http://localhost:9000/rag"
 }
 
 # --- Global config ---
 QUERY = "Which animals can hover in the air?"
+# Number of documents to retrieve
 K = 2
-REQUEST_RATES = [1, 5, 10, 20, 50, 100]
-REQUESTS_PER_RATE = 100
-TIMEOUT = 30.0
+# RPS to test
+REQUEST_RATES = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+# Total number of requests to send at each RPS
+REQUESTS_PER_RATE = 200
+# Timeout for each request. This is the maximum time to wait for a response. Also allows time for the server to respond, important for measuring tail latencies.
+TIMEOUT = 50.0
 CSV_FILENAME = "end_to_end_results.csv"
 POISSON_SEED = 42  # For reproducibility
 
@@ -113,6 +117,9 @@ async def main(mode: str, target: str):
         for key, value in stats.items():
             print(f"{key}: {value}")
         all_results[rps] = stats
+        
+        print("Waiting for cooldown before next RPS test...")
+        await asyncio.sleep(50)  # Cooldown delay
 
     save_results_to_csv(all_results, mode, target)
     print(f"\n Results saved to: {target}_{mode}_{CSV_FILENAME}")

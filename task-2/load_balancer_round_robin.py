@@ -4,37 +4,43 @@ from fastapi import FastAPI, Request
 import httpx
 from typing import List, Dict
 from collections import defaultdict
+from contextlib import asynccontextmanager
 
-app = FastAPI()
-
-# List of backends (you can update this dynamically later)
-BACKENDS = ["http://localhost:8001", "http://localhost:8002"]
-
-# Shared round-robin counter with thread safety
-backend_lock = asyncio.Lock()
+# Backends
+BACKENDS = ["http://localhost:8000", "http://localhost:8001", "http://localhost:8002"]
 backend_index = 0
+backend_lock = asyncio.Lock()
 
-# RPS tracking
+# RPS Tracking
 request_counts: Dict[str, int] = defaultdict(int)
 last_reset = time.time()
 reset_interval = 5  # seconds
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async def reset_loop():
+        global last_reset
+        while True:
+            await asyncio.sleep(reset_interval)
+            last_reset = time.time()
+            for backend in BACKENDS:
+                request_counts[backend] = 0
+    asyncio.create_task(reset_loop())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/rag")
 async def proxy_request(request: Request):
     global backend_index
-
-    # Round-robin selection (thread-safe)
     async with backend_lock:
         backend = BACKENDS[backend_index % len(BACKENDS)]
         backend_index += 1
         
-    print(f"[Load Balancer] Forwarding request to: {backend}")
+    print(f"[Load Balancer] Forwarding request to backend: {backend}")
 
-    # Track RPS
     request_counts[backend] += 1
 
-    # Forward request
     payload = await request.json()
     async with httpx.AsyncClient() as client:
         try:
@@ -44,33 +50,14 @@ async def proxy_request(request: Request):
         except Exception as e:
             return {"error": f"Failed to forward request to {backend}: {str(e)}"}
 
-
 @app.get("/metrics")
 async def get_metrics():
-    """Return the current RPS estimates for each backend."""
     now = time.time()
-    elapsed = now - last_reset
-    if elapsed == 0:
-        elapsed = 1e-6  # prevent division by zero
-
-    rps_snapshot = {
-        backend: round(count / elapsed, 2) for backend, count in request_counts.items()
-    }
+    elapsed = now - last_reset or 1e-6
     return {
         "interval_seconds": round(elapsed, 2),
-        "rps": rps_snapshot,
+        "rps": {
+            backend: round(count / elapsed, 2) for backend, count in request_counts.items()
+        },
         "backend_list": BACKENDS,
     }
-
-
-@app.on_event("startup")
-async def reset_rps_loop():
-    """Background task to reset RPS counters periodically."""
-    async def reset_loop():
-        global last_reset
-        while True:
-            await asyncio.sleep(reset_interval)
-            last_reset = time.time()
-            for backend in BACKENDS:
-                request_counts[backend] = 0
-    asyncio.create_task(reset_loop())

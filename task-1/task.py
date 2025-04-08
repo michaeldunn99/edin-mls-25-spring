@@ -1,6 +1,6 @@
 import torch
 import cupy as cp
-import triton
+#import triton
 import numpy as np
 import time
 import json
@@ -1052,12 +1052,12 @@ def our_ann_cosine(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 
 # Example
-def test_kmeans(func, N, D, A, K, repeat):
+def test_kmeans(func, N, D, A, K, num_streams, gpu_batch_number, max_iterations, repeat):
     # Warm up
-    result = func(N, D, A, K)
+    result = func(N, D, A, K, num_streams, gpu_batch_number, max_iterations)
     start = time.time()
     for _ in range(repeat):
-        result = func(N, D, A, K)
+        result = func(N, D, A, K, num_streams, gpu_batch_number, max_iterations)
     # Synchronise to ensure all GPU computations are finished before measuring end time
     cp.cuda.Stream.null.synchronize()
     end = time.time()
@@ -1156,28 +1156,31 @@ if __name__ == "__main__":
     K = 10
     repeat = 1
     num_clusters = 500
+    num_streams = 4
+    gpu_batch_num = 32
+    max_iters = 10
     
     # Build index for testing ann and comparing to knn
-    cluster_assignments, centroids_gpu = our_kmeans_L2(N, D, A, num_clusters)
+    #cluster_assignments, centroids_gpu = our_kmeans_L2(N, D, A, num_clusters)
 
     knn_functions = [our_knn_L2_CUPY]
-    kmeans_functions = []
+    kmeans_functions = [our_kmeans_L2_updated]
     ann_functions = [our_ann_L2_query_only]
     # Testing recall
-    ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
-    knn_result = our_knn_L2_CUPY(N, D, A, X, K)
-    print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
+    #ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
+    #knn_result = our_knn_L2_CUPY(N, D, A, X, K)
+    #print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
  
-    if knn_functions:
+    """ if knn_functions:
         for func in knn_functions:
-            test_knn(func, N, D, A, X, K, repeat)
+            test_knn(func, N, D, A, X, K, repeat) """
     
     if kmeans_functions:
         for func in kmeans_functions:
-            test_kmeans(func, N, D, A, num_clusters, repeat)
+            test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
             
-    if ann_functions:
+    """ if ann_functions:
         for func in ann_functions:
-            test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
+            test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu) """
 
         

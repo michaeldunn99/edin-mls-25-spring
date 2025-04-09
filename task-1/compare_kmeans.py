@@ -2,8 +2,49 @@ import numpy as np
 from triton_task import TritonKMeans
 import cupy as cp
 import time
-from task import our_kmeans_L2, our_kmeans_L2_updated, our_k_means_L2_cpu
+from task import our_kmeans_L2, our_kmeans_L2_updated, our_k_means_L2_cpu, our_kmeans_L2_updated_no_batching
 import torch
+
+
+
+
+def test_kmeans_time_wrapper(func, N, D, A, K, repeat):
+    # Warm up, first run seems to be a lot longer than the subsequent runs
+    # result = func(N, D, A, K, number_streams, gpu_batch_number, max_iterations)
+    total_time = 0
+    for _ in range(repeat):
+        start = time.time()
+        # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
+        result = func(N, D, A, K)
+        cp.cuda.Stream.null.synchronize()
+        end = time.time()
+        elapsed_time = end - start
+        total_time += elapsed_time
+        cp.get_default_memory_pool().free_all_blocks()
+    # Synchronise to ensure all GPU computations are finished before measuring end time
+    avg_time = (total_time / repeat) * 1000 # Runtime in ms
+    print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
+    return avg_time
+
+def my_test_k_means():
+    funcs = [
+        our_kmeans_L2_updated_no_batching,
+        our_kmeans_L2_updated,
+        # our_kmeans_L2
+    ]
+    N = 6000000
+    D = 512
+    A = np.random.rand(N, D).astype(np.float32)
+    K = 10
+    repeat = 1
+    times = []
+    for func in funcs:
+        print(f"Testing function: {func.__name__}")
+        result = test_kmeans_time_wrapper(func, N, D, A, K, repeat=repeat)
+        torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
+        times.append(result)
+    for i, time in enumerate(times):
+        print(f"Function {funcs[i].__name__} took {time:.6f} milliseconds")
 
 def configure_cupy_batches_and_streams():
     N = 1000000
@@ -30,45 +71,6 @@ def configure_cupy_batches_and_streams():
                 best_time = avg_time
             print(f"Average time for {num_streams} streams and {gpu_batch_num} batches: {avg_time:.6f} seconds")
     print(f"Best configuration: {best_config[0]} streams and {best_config[1]} batches")
-
-
-
-
-def my_test_k_means():
-    N = 2000000
-    D = 1024
-    A = np.random.rand(N, D).astype(np.float32)
-    K = 10
-    num_streams = 4
-    gpu_assignments = 32
-    max_iterations = 10
-    
-    start = time.time()
-    # triton_kmeans = TritonKMeans(n_clusters=K, verbose=True)
-    alt_result = our_kmeans_L2_updated(N, D, A, K, number_streams=num_streams, gpu_batch_number=gpu_assignments, max_iterations=max_iterations)
-    # triton_kmeans.fit(A)  # A is a (N, D) NumPy array
-    # labels = triton_kmeans.predict()
-    cp.cuda.Stream.null.synchronize()
-    end = time.time()
-    # print(labels)
-    print(f"Time = {end-start}")
-    print(alt_result)
-    # Warm up
-    start = time.time()
-    result = our_k_means_L2_cpu(N, D, A, K)
-    print(result)
-    # Synchronise to ensure all GPU computations are finished before measuring end time
-    end = time.time()
-    avg_time = (end - start) # Runtime in ms
-    print(f"CPU {our_k_means_L2_cpu.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
-    #check whether the two results are the same
-    gpu_assignments = alt_result[0]
-    cpu_assignments = result[0]
-    if np.array_equal(gpu_assignments, cpu_assignments):
-        print("The GPU and CPU results are the same.")
-    else:
-        print("The GPU and CPU results are different.")
-        print(f"There is disagreement at indices: {np.where(gpu_assignments != cpu_assignments)}")    
 
 if __name__ == "__main__":
     my_test_k_means()

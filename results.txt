@@ -1,0 +1,53 @@
+Running our_knn_L2_CUDA with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_L2_CUDA - Result: [3249877 3687170  858573 3687002  369510   96181 3455184 2340292  851328
+ 3048378], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1749.643779 milliseconds.
+
+Running our_knn_L2_CUPY with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_L2_CUPY - Result: [3249877 3687170  858573 3687002  369510   96181 3455184 2340292  851328
+ 3048378], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1759.355783 milliseconds.
+
+Running our_knn_l2_triton with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_l2_triton - Result: [3249877 3687170  858573 3687002  369510   96181 3455184 2340292  851328
+ 3048378], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1788.891220 milliseconds.
+
+Running our_knn_l2_cpu with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_l2_cpu - Result: [3249877 3687170  858573 3687002  369510   96181 3455184 2340292  851328
+ 3048378], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 14314.399338 milliseconds.
+
+
+Running our_knn_L1_CUPY with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_L1_CUPY - Result: [3249877 3687170 3085292  858573 3048378  857202 1739008 3687002  480409
+ 2067925], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1778.163004 milliseconds.
+
+Running our_knn_l1_triton with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_l1_triton - Result: [3249877 3687170 3085292  858573 3048378  857202 1739008 3687002  480409
+ 2067925], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1790.986800 milliseconds.
+
+Running our_knn_l1_cpu with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_l1_cpu - Result: [3249877 3687170 3085292  858573 3048378  857202 1739008 3687002  480409
+ 2067925], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 14203.036833 milliseconds.
+
+Running our_knn_cosine_CUPY with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_cosine_CUPY - Result: [3249877 1728773 3687170   96181 2067925 2340292  269672 2821631 2152457
+  369510], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1774.191523 milliseconds.
+
+Running our_knn_cosine_triton with 4000000 vectors of dimension 512 and K=10 for 10 times.
+our_knn_cosine_triton - Result: [3249877 1728773 3687170   96181 2067925 2340292  269672 2821631 2152457
+  369510], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 1800.017858 milliseconds.
+...
+our_knn_cosine_cpu - Result: [3249877 1728773 3687170   96181 2067925 2340292  269672 2821631 2152457
+  369510], Number of Vectors: 4000000, Dimension: 512, K: 10, 
+Time: 9510.686231 milliseconds.
+
+
+
+

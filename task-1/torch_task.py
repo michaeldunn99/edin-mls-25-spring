@@ -317,11 +317,7 @@ def our_kmeans_L2_TORCH_no_batching(N, D, A, K, num_streams, gpu_batch_num, max_
 
     streams = [torch.cuda.Stream() for _ in range(num_streams)]
 
-    A_is_tensor = isinstance(A, torch.Tensor)
-    if A_is_tensor:
-        A = A.to(device=device, dtype=torch.float32)
-    else:
-        A = torch.from_numpy(A).to(device=device, dtype=torch.float32)
+    A = torch.from_numpy(A).to(device=device, dtype=torch.float32)
     
     # Initialize centroids randomly from A
     np.random.seed(42)
@@ -459,11 +455,11 @@ if __name__ == "__main__":
         our_knn_L1_TORCH
     ]
 
-    kmeans_functions = [our_kmeans_L2_TORCH, our_kmeans_L2_TORCH_no_batching]
+    kmeans_functions = [our_kmeans_L2_TORCH_no_batching, our_kmeans_L2_TORCH]
 
     # Run tests
-    for func in knn_functions:
-        test_knn(func, N, D, A, X, K, repeat)
+    """ for func in knn_functions:
+        test_knn(func, N, D, A, X, K, repeat) """
     
     for func in kmeans_functions:
         test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)

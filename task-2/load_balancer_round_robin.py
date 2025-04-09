@@ -54,7 +54,7 @@ async def register_backend(request: BackendRequest):
     async with backend_lock:
         if request.url not in BACKENDS:
             BACKENDS.append(request.url)
-            print(f"[Load Balancer] ✅ Registered backend: {request.url}")
+            print(f"[Load Balancer] Registered backend: {request.url}")
     return {"status": "registered", "backend": request.url}
 
 @app.post("/unregister")
@@ -62,7 +62,7 @@ async def unregister_backend(request: BackendRequest):
     async with backend_lock:
         if request.url in BACKENDS:
             BACKENDS.remove(request.url)
-            print(f"[Load Balancer] ❌ Unregistered backend: {request.url}")
+            print(f"[Load Balancer] Unregistered backend: {request.url}")
     return {"status": "unregistered", "backend": request.url}
 
 @app.get("/assign")
@@ -75,7 +75,7 @@ async def assign_backend():
         backend_index = (backend_index + 1) % len(BACKENDS)
         request_counts[backend] += 1
 
-    print(f"[Load Balancer] ↪️ Assigned backend: {backend}/rag")
+    print(f"[Load Balancer] Assigned backend: {backend}/rag")
     return {"backend": f"{backend}/rag"}
 
 @app.get("/metrics")

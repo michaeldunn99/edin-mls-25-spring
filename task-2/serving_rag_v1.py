@@ -32,16 +32,16 @@ documents = [
 ]
 
 # Load embedding model
-EMBED_MODEL_NAME = "/home/s2706676/rag_models/e5-large-instruct"
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
 embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to("cuda")
 
 # Load text generation model
-chat_pipeline = pipeline("text-generation", model="/home/s2706676/rag_models/opt-125m")
+chat_pipeline = pipeline("text-generation", model="facebook/opt-125m", device=0)
 
 # Compute average-pool embeddings
 def get_embedding_batch(texts: list[str]) -> np.ndarray:
-    inputs = embed_tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+    inputs = embed_tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to("cuda")
     with torch.no_grad():
         outputs = embed_model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
@@ -74,39 +74,31 @@ def batch_worker():
             time.sleep(0.01)
             continue
 
-        print(f"[Batch Worker] Processing batch of size {len(batch)}")
-
         try:
             # Extract the queries, ks, and ids from the batch
             requests = [item[1] for item in batch]
             queries = [req.query for req in requests]
             ks = [req.k for req in requests]
             ids = [req._id for req in requests]
-            print("[Batch Worker] Extracted queries and metadata.")
 
             # Get the embeddings for the queries and retrieve the top-k documents
             query_embs = get_embedding_batch(queries)
-            print("[Batch Worker] Computed query embeddings.")
 
             retrieved_docs_batch = retrieve_top_k_batch(query_embs, ks)
-            print("[Batch Worker] Retrieved top-k documents.")
 
             # Create prompts for the chat model
             prompts = [
                 f"Question: {query}\nContext:\n{chr(10).join(docs)}\nAnswer:"
                 for query, docs in zip(queries, retrieved_docs_batch)
             ]
-            print("[Batch Worker] Created prompts for generation.")
 
             # Generate responses
             generations = chat_pipeline(prompts, max_length=50, do_sample=True)
-            print("[Batch Worker] Generated responses.")
 
             results = [g[0]["generated_text"] for g in generations]
 
             for req_id, result in zip(ids, results):
                 response_queues[req_id].put(result)
-            print("[Batch Worker] Responses placed in queues.")
 
         except Exception as e:
             print(f"[Batch Worker ERROR] Chat generation failed: {e}")
@@ -119,8 +111,6 @@ Thread(target=batch_worker, daemon=True).start()
 
 @app.post("/rag")
 def predict(payload: QueryRequest):
-    # DEBUGGING
-    print(f"[{os.environ.get('PORT')}] Received request for query: {payload.query}")
     # Generate a unique request ID for the payload.
     payload._id = f"req_{uuid.uuid4()}"  # Set internal ID here
 
@@ -131,7 +121,7 @@ def predict(payload: QueryRequest):
     request_queue.add_request(payload)
 
     try:
-        result = resp_q.get(timeout=60)  # seconds
+        result = resp_q.get()  # seconds
     except Exception as e:
         print(f"[{os.environ.get('PORT')}] Timeout or error in response queue: {e}")
         return {"error": "Timeout waiting for batch response"}

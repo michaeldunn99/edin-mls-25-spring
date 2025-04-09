@@ -16,9 +16,9 @@ TARGET_ENDPOINTS = {
 # --- Global config ---
 QUERY = "Which animals can hover in the air?"
 K = 2
-REQUEST_RATES = [10]
-REQUESTS_PER_RATE = 200
-TIMEOUT = 50.0
+REQUEST_RATES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+REQUESTS_PER_RATE = 1000
+TIMEOUT = 60.0
 CSV_FILENAME = "end_to_end_results.csv"
 POISSON_SEED = 42
 
@@ -36,12 +36,12 @@ async def send_request(client: httpx.AsyncClient, session_id: int, endpoint: str
         if target == "load_balancer_round_robin":
             assign_resp = await client.get(endpoint)
             assigned_backend = assign_resp.json().get("backend")
-            print(f"[DEBUG] Assigned backend: {assigned_backend}")
+            #print(f"[DEBUG] Assigned backend: {assigned_backend}")
             if not assigned_backend:
                 raise ValueError("No backend assigned.")
             response = await client.post(assigned_backend, json=payload)
         else:
-            print(f"[DEBUG] Sending POST to: {assigned_backend}")
+            #print(f"[DEBUG] Sending POST to: {assigned_backend}")
             response = await client.post(endpoint, json=payload)
 
         latency = time.time() - start

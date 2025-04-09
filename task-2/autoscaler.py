@@ -4,15 +4,16 @@ import subprocess
 import time
 import os
 
-CHECK_INTERVAL = 10  # seconds
-MAX_INSTANCES = 5
-MIN_INSTANCES = 4
+CHECK_INTERVAL = 5  # seconds
+MAX_INSTANCES = 3
+# Keeping one warm instance
+MIN_INSTANCES = 2
 
-SCALE_UP_THRESHOLD = 3.0   # RPS
-SCALE_DOWN_THRESHOLD = 1.0  # RPS
-
+SCALE_UP_THRESHOLD = 29.0   # RPS
+SCALE_DOWN_THRESHOLD = 25.0  # RPS
+# Time between scale up/down actions, to prevent rapid scaling
 SCALE_UP_COOLDOWN = 30     # seconds
-SCALE_DOWN_COOLDOWN = 2000  # seconds
+SCALE_DOWN_COOLDOWN = 120  # seconds
 
 BACKEND_BASE_PORT = 8000
 SERVING_SCRIPT = "serving_rag_v1.py"

@@ -17,16 +17,11 @@ documents = [
 ]
 
 # 1. Load embedding model
-#EMBED_MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
-# Downloaded local model
-EMBED_MODEL_NAME = "/home/s2706676/rag_models/e5-large-instruct"
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
 embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to("cuda")
 
-# Basic Chat LLM
-# chat_pipeline = pipeline("text-generation", model="facebook/opt-125m")
-# Using downloaded local model
-chat_pipeline = pipeline("text-generation", model="/home/s2706676/rag_models/opt-125m")
+chat_pipeline = pipeline("text-generation", model="facebook/opt-125m", device=0)
 # Note: try this 1.5B model if you got enough GPU memory
 # chat_pipeline = pipeline("text-generation", model="Qwen/Qwen2.5-1.5B-Instruct")
 
@@ -45,7 +40,7 @@ chat_pipeline = pipeline("text-generation", model="/home/s2706676/rag_models/opt
 
 def get_embedding(text: str) -> np.ndarray:
     """Compute a simple average-pool embedding."""
-    inputs = embed_tokenizer(text, return_tensors="pt", truncation=True)
+    inputs = embed_tokenizer(text, return_tensors="pt", truncation=True).to("cuda")
     with torch.no_grad():
         outputs = embed_model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).cpu().numpy()

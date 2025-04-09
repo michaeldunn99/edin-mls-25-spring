@@ -2428,7 +2428,7 @@ if __name__ == "__main__":
     
     if kmeans_functions:
         for func in kmeans_functions:
-            test_kmeans(func, N, D, A, num_clusters, repeat)
+            test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
             
     # if ann_functions:
     #     for func in ann_functions:

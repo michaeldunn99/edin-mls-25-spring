@@ -962,8 +962,8 @@ def our_knn_L2_CUDA(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 
 def our_knn_L2_CUPY(N, D, A, X, K):
-    gpu_batch_num = 32 #TO DO: Update these based on available GPU memory
-    stream_num = 4 #TO_DO: Update these based on availabe GPU memory
+    gpu_batch_num = 1 #TO DO: Update these based on available GPU memory
+    stream_num = 1 #TO_DO: Update these based on availabe GPU memory
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
     # final_distances_streams = [cp.zeros(N, dtype=cp.float32) for _ in range(stream_num)]
@@ -1011,8 +1011,8 @@ def our_knn_L2_CUPY(N, D, A, X, K):
 
 
 def our_knn_cosine_CUPY(N, D, A, X, K):
-    gpu_batch_num = 32 #TO DO: Update these based on available GPU memory
-    stream_num = 4 #TO_DO: Update these based on availabe GPU memory
+    gpu_batch_num = 4 #TO DO: Update these based on available GPU memory
+    stream_num = 2 #TO_DO: Update these based on availabe GPU memory
     gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
@@ -2424,7 +2424,7 @@ if __name__ == "__main__":
  
     if knn_functions:
         for func in knn_functions:
-            test_knn(func, N, D, A, X, K, repeat)
+            test_knn_wrapper(func, N, D, A, X, K, repeat)
     
     if kmeans_functions:
         for func in kmeans_functions:

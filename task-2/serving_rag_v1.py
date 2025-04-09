@@ -10,6 +10,7 @@ import os
 import time
 from request_queue import RequestQueue
 import uvicorn
+import uuid
 
 ################################ VERSION WITH REQUEST QUEUE AND BATCHER ################################
 
@@ -17,7 +18,7 @@ app = FastAPI()
 
 # Constants for batching
 MAX_BATCH_SIZE = 10
-MAX_WAIT_TIME = 1  # seconds
+MAX_WAIT_TIME = 0.5  # seconds
 
 # Global request queue
 request_queue = RequestQueue()
@@ -72,38 +73,56 @@ def batch_worker():
             # If there is no batch, sleep for a short time before checking again
             time.sleep(0.01)
             continue
-        # Extract the queries, ks, and ids from the batch
-        requests = [item[1] for item in batch]
 
-        queries = [req.query for req in requests]
-        ks = [req.k for req in requests]
-        ids = [req._id for req in requests]
+        print(f"[Batch Worker] Processing batch of size {len(batch)}")
 
-        # Get the embeddings for the queries and retrieve the top-k documents for each query
-        query_embs = get_embedding_batch(queries)
-        retrieved_docs_batch = retrieve_top_k_batch(query_embs, ks)
+        try:
+            # Extract the queries, ks, and ids from the batch
+            requests = [item[1] for item in batch]
+            queries = [req.query for req in requests]
+            ks = [req.k for req in requests]
+            ids = [req._id for req in requests]
+            print("[Batch Worker] Extracted queries and metadata.")
 
-        # Create prompts for the chat model
-        prompts = [
-            f"Question: {query}\nContext:\n{chr(10).join(docs)}\nAnswer:"
-            for query, docs in zip(queries, retrieved_docs_batch)
-        ]
+            # Get the embeddings for the queries and retrieve the top-k documents
+            query_embs = get_embedding_batch(queries)
+            print("[Batch Worker] Computed query embeddings.")
 
-        # Passes all the prompts together to the chat model
-        generations = chat_pipeline(prompts, max_length=50, do_sample=True)
-        results = [g[0]["generated_text"] for g in generations]
+            retrieved_docs_batch = retrieve_top_k_batch(query_embs, ks)
+            print("[Batch Worker] Retrieved top-k documents.")
 
+            # Create prompts for the chat model
+            prompts = [
+                f"Question: {query}\nContext:\n{chr(10).join(docs)}\nAnswer:"
+                for query, docs in zip(queries, retrieved_docs_batch)
+            ]
+            print("[Batch Worker] Created prompts for generation.")
 
-        for req_id, result in zip(ids, results):
-            response_queues[req_id].put(result)
+            # Generate responses
+            generations = chat_pipeline(prompts, max_length=50, do_sample=True)
+            print("[Batch Worker] Generated responses.")
+
+            results = [g[0]["generated_text"] for g in generations]
+
+            for req_id, result in zip(ids, results):
+                response_queues[req_id].put(result)
+            print("[Batch Worker] Responses placed in queues.")
+
+        except Exception as e:
+            print(f"[Batch Worker ERROR] Chat generation failed: {e}")
+            for req_id in ids:
+                response_queues[req_id].put(f"Generation failed: {str(e)}")
+
 
 # Launch background batch processing thread
 Thread(target=batch_worker, daemon=True).start()
 
 @app.post("/rag")
 def predict(payload: QueryRequest):
+    # DEBUGGING
+    print(f"[{os.environ.get('PORT')}] Received request for query: {payload.query}")
     # Generate a unique request ID for the payload.
-    payload._id = f"req_{time.time_ns()}"  # Set internal ID here
+    payload._id = f"req_{uuid.uuid4()}"  # Set internal ID here
 
     resp_q = Queue()
     response_queues[payload._id] = resp_q
@@ -111,7 +130,11 @@ def predict(payload: QueryRequest):
     # Add the request to the request queue
     request_queue.add_request(payload)
 
-    result = resp_q.get()
+    try:
+        result = resp_q.get(timeout=60)  # seconds
+    except Exception as e:
+        print(f"[{os.environ.get('PORT')}] Timeout or error in response queue: {e}")
+        return {"error": "Timeout waiting for batch response"}
     del response_queues[payload._id]
 
     return {
@@ -121,4 +144,5 @@ def predict(payload: QueryRequest):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)

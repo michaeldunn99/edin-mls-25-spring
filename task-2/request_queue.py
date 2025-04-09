@@ -24,26 +24,25 @@ class RequestQueue:
         - The wait time exceeds MAX_WAIT_TIME
 
         """
-        now = now or time.time() # now paramter is useful for testing
-        # Initialise an empty list to store the batch of requests
+        now = now or time.time()
         batch = []
 
-        # Ensuring that only one thread can read from the queue at a time
         with self.lock:
-            # While neither condition is met, keep checking the queue
-            while self.queue and len(batch) < MAX_BATCH_SIZE:
-                # Get the oldest request from the queue
-                oldest_timestamp, _ = self.queue[0]
-                # Calculate the waiting time since the oldest request was added
-                waiting_time = now - oldest_timestamp
+            if not self.queue:
+                return batch
 
-                # Check if the wait time exceeds MAX_WAIT_TIME
-                if waiting_time >= MAX_WAIT_TIME:
-                    # Add the oldest request to the batch 
+            # Condition 1: Enough requests to fill a batch (immediate return)
+            if len(self.queue) >= MAX_BATCH_SIZE:
+                for _ in range(MAX_BATCH_SIZE):
                     batch.append(self.queue.popleft())
-                else:
-                    break
+                return batch
 
-        # Return the batch of requests
-        return batch
+            # Condition 2: First request has waited long enough
+            oldest_timestamp, _ = self.queue[0]
+            if (now - oldest_timestamp) >= MAX_WAIT_TIME:
+                while self.queue and len(batch) < MAX_BATCH_SIZE:
+                    batch.append(self.queue.popleft())
+                return batch
+
+        return batch  # Neither condition met; return empty. Empty batch is handled in batch_worker in serving_rag_v1.py
     

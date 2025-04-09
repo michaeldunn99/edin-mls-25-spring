@@ -2422,13 +2422,13 @@ if __name__ == "__main__":
     # knn_result = our_knn_L2_CUPY(N, D, A, X, K)
     # print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
  
-    if knn_functions:
+    """ if knn_functions:
         for func in knn_functions:
-            test_knn(func, N, D, A, X, K, repeat)
+            test_knn(func, N, D, A, X, K, repeat) """
     
     if kmeans_functions:
         for func in kmeans_functions:
-            test_kmeans(func, N, D, A, num_clusters, repeat)
+            test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
             
     # if ann_functions:
     #     for func in ann_functions:

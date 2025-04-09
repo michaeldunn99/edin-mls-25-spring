@@ -390,6 +390,81 @@ def our_kmeans_L2_TORCH_no_batching(N, D, A, K, num_streams, gpu_batch_num, max_
     centroids_cpu = centroids.cpu().numpy()
     return cluster_assignments_cpu, centroids_cpu
     
+# ------------------------------------------------------------------------------------------------
+# Your Task 2.2 code here
+# ------------------------------------------------------------------------------------------------
+
+def our_ann_l2_TORCH(N, D, A, X, K, cluster_assignments, centroids_np, device="cuda"):
+    """
+    PyTorch implementation of Approximate Nearest Neighbors (ANN) search using L2 distance.
+    Assumes cluster_assignments and centroids_gpu are precomputed from k-means clustering.
+
+    Args:
+        N (int): Number of vectors in the dataset.
+        D (int): Dimension of each vector.
+        A (np.ndarray): Dataset array [N, D] on CPU.
+        X (np.ndarray): Query vector [D] on CPU.
+        K (int): Number of nearest neighbors to find.
+        cluster_assignments (np.ndarray): Cluster assignments for each vector [N].
+        centroids_gpu (torch.Tensor): Centroids from k-means [num_clusters, D] on GPU.
+        device (str): Device to run on ("cuda").
+
+    Returns:
+        np.ndarray: Indices of the K approximate nearest neighbors [K].
+    """
+    if device != "cuda":
+        raise ValueError("This implementation requires a CUDA device for stream optimization.")
+    
+    X_gpu = torch.from_numpy(X).to(device=device, dtype=torch.float32)
+    centroids_gpu = torch.from_numpy(centroids_np).to(device=device, dtype=torch.float32)
+    num_clusters = centroids_gpu.shape[0]
+    distances = torch.norm(centroids_gpu - X_gpu, dim=1)  # L2 distance
+    K1 = num_clusters // 10
+    top_cluster_ids = torch.topk(distances, K1, largest=False, sorted=False)[1]  # Indices of K1 smallest distances
+    top_clusters_set = torch.zeros(num_clusters, dtype=torch.bool, device=device)
+    top_clusters_set[top_cluster_ids] = True
+
+    # Step 2: Create mask to select points from top K1 clusters
+    cluster_assignments_gpu = torch.from_numpy(cluster_assignments).to(device)
+    mask = top_clusters_set[cluster_assignments_gpu]
+    all_indices_gpu = torch.nonzero(mask, as_tuple=False).squeeze()
+
+    if all_indices_gpu.numel() == 0:
+        return np.array([], dtype=np.int32)
+    
+    # Copy candidate indices to CPU once
+    all_indices_cpu = all_indices_gpu.cpu().numpy()
+    candidate_N = all_indices_cpu.shape[0]
+
+    # Allocate final distance buffer on GPU
+    final_distances = torch.empty(candidate_N, dtype=torch.float32, device=device)
+
+    # Step 3: Streamed batch kNN on candidate pool
+    gpu_batch_num = 3
+    gpu_batch_size = (candidate_N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
+    streams = [torch.cuda.Stream(device=device) for _ in range(gpu_batch_num)]
+    A_device = [torch.empty((gpu_batch_size, D), dtype=torch.float32, device=device) for _ in range(gpu_batch_num)]
+    D_device = [torch.empty(gpu_batch_size, dtype=torch.float32, device=device) for _ in range(gpu_batch_num)]
+
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i]
+        batch_size = end - start
+        with torch.cuda.stream(stream):
+            # Asynchronous copy from CPU to GPU
+            A_device[i][:batch_size].copy_(torch.from_numpy(A[all_indices_cpu[start:end]]).to(device))
+            A_batch = A_device[i][:batch_size]
+            D_device[i][:batch_size] = torch.norm(A_batch - X_gpu, dim=1)
+            final_distances[start:end] = D_device[i][:batch_size]
+
+    # Synchronize all streams
+    torch.cuda.synchronize(device=device)
+
+    # Step 4: Final Top-K selection on GPU
+    top_k_indices = torch.topk(final_distances, K, largest=False, sorted=True)[1]
+    final_result = all_indices_cpu[top_k_indices.cpu().numpy()]
+    return final_result
+    
 
 # ------------------------------------------------------------------------------------------------
 # Test Functions
@@ -430,6 +505,18 @@ def test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
     avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
     print(f"Torch {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
 
+def test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_np):
+    # Warm up GPU
+    result = func(N, D, A, X, K, cluster_assignments, centroids_np)
+    start = time.time()
+    for _ in range(repeat):
+        # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
+        result = func(N, D, A, X, K, cluster_assignments, centroids_np)
+    torch.cuda.synchronize()
+    end = time.time()
+    avg_time = ((end - start) / repeat) * 1000 # Runtime in ms
+    print(f"Torch {func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, Time: {avg_time:.6f} milliseconds.")
+
 # ------------------------------------------------------------------------------------------------
 # Main Test Script
 # ------------------------------------------------------------------------------------------------
@@ -440,7 +527,7 @@ if __name__ == "__main__":
     D = 1024
     A = np.random.randn(N, D).astype(np.float32)
     X = np.random.randn(D).astype(np.float32)
-    K = 10
+    K = 50
     repeat = 1
 
     num_streams = 4
@@ -456,10 +543,17 @@ if __name__ == "__main__":
     ]
 
     kmeans_functions = [our_kmeans_L2_TORCH_no_batching, our_kmeans_L2_TORCH]
+    cluster_assignments, centroids_gpu = our_kmeans_L2_TORCH(N, D, A, K, num_streams, gpu_batch_num, max_iters)
+
+    ann_functions = [our_ann_l2_TORCH]
 
     # Run tests
     """ for func in knn_functions:
         test_knn(func, N, D, A, X, K, repeat) """
     
-    for func in kmeans_functions:
-        test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
+    """for func in kmeans_functions:
+        test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)"""
+    
+    if ann_functions:
+        for func in ann_functions:
+            test_ann_query_only(func, N, D, A, X, 10, repeat, cluster_assignments, centroids_gpu)

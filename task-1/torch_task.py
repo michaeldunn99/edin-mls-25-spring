@@ -177,6 +177,121 @@ def our_knn_L1_TORCH(N, D, A, X, K):
 def our_kmeans_L2_TORCH(N, D, A, K, num_streams, gpu_batch_num, max_iters, device="cuda"):
     """
     Optimized k-means clustering using L2 distance with batching and multiple CUDA streams in PyTorch.
+    Assumes A is a NumPy array on CPU and batches are transferred to GPU on-demand.
+
+    Args:
+        N (int): Number of vectors.
+        D (int): Dimension of vectors.
+        A (np.ndarray): Input data [N, D] on CPU.
+        K (int): Number of clusters.
+        num_streams (int): Number of CUDA streams.
+        gpu_batch_num (int): Number of batches.
+        max_iters (int): Maximum number of iterations.
+        device (str): Device to run on ("cuda").
+
+    Returns:
+        tuple: (cluster_assignments, centroids) as NumPy arrays.
+    """
+    if device != "cuda":
+        raise ValueError("This implementation requires a CUDA device for stream optimization.")
+    tol = 1e-4
+
+    # Set up batching
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    # Create multiple CUDA streams
+    streams = [torch.cuda.Stream() for _ in range(num_streams)]
+
+    # Preallocate per-stream buffers
+    A_device = [torch.empty((gpu_batch_size, D), dtype=torch.float32, device=device) for _ in range(num_streams)]
+    assignments_gpu = [torch.empty(gpu_batch_size, dtype=torch.int32, device=device) for _ in range(num_streams)]
+
+    # Initialize centroids randomly from A (on CPU, then move to GPU)
+    np.random.seed(42)
+    indices = np.random.choice(N, K, replace=False)
+    centroids = torch.from_numpy(A[indices]).to(device=device, dtype=torch.float32).clone()
+
+    # Preallocate cluster assignments on GPU
+    cluster_assignments = torch.empty(N, dtype=torch.int32, device=device)
+
+    for iteration in range(max_iters):
+        print(f"Iteration: {iteration}")
+
+        # Per-stream buffers for cluster sums and counts
+        cluster_sums_stream = [torch.zeros((K, D), dtype=torch.float32, device=device) for _ in range(num_streams)]
+        counts_stream = [torch.zeros(K, dtype=torch.int32, device=device) for _ in range(num_streams)]
+
+        # Process each batch in a stream
+        for i, (start, end) in enumerate(gpu_batches):
+            stream = streams[i % num_streams]
+            A_buf = A_device[i % num_streams]
+            assignments_buf = assignments_gpu[i % num_streams]
+            batch_size = end - start
+            with torch.cuda.stream(stream):
+                # Asynchronous copy from CPU to GPU
+                A_buf[:batch_size].copy_(torch.from_numpy(A[start:end]).to(device))
+
+                A_batch = A_buf[:batch_size]
+
+                # Compute squared L2 distances
+                A_norm = torch.sum(A_batch ** 2, dim=1, keepdim=True)
+                C_norm = torch.sum(centroids ** 2, dim=1, keepdim=True).T
+                dot = A_batch @ centroids.T
+                distances = A_norm + C_norm - 2 * dot
+
+                # Assign to nearest centroid
+                assignments = torch.argmin(distances, dim=1)
+                assignments_buf[:batch_size] = assignments
+                cluster_assignments[start:end] = assignments_buf[:batch_size]
+
+                # One-hot encoding for assignments
+                one_hot = torch.zeros((batch_size, K), dtype=torch.float32, device=device)
+                one_hot[torch.arange(batch_size), assignments] = 1
+
+                # Compute batch cluster sums and counts
+                batch_cluster_sum = one_hot.T @ A_batch  # (K, D)
+                batch_counts = one_hot.sum(dim=0).to(torch.int32)  # (K,)
+
+                # Accumulate into per-stream buffers
+                cluster_sums_stream[i % num_streams] += batch_cluster_sum
+                counts_stream[i % num_streams] += batch_counts
+
+        # Synchronize all streams
+        torch.cuda.synchronize()
+
+        # Combine per-stream buffers
+        cluster_sum = sum(cluster_sums_stream)
+        counts = sum(counts_stream)
+
+        # Detect and handle dead centroids
+        dead_mask = (counts == 0)
+        if torch.any(dead_mask):
+            num_dead = dead_mask.sum().item()
+            reinit_indices = np.random.choice(N, num_dead, replace=False)
+            reinit_centroids = torch.from_numpy(A[reinit_indices]).to(device, dtype=torch.float32).clone()
+            centroids[dead_mask] = reinit_centroids
+
+        # Avoid division by zero
+        counts = torch.clamp(counts, min=1)
+        updated_centroids = cluster_sum / counts[:, None]
+
+        # Check for convergence
+        shift = torch.norm(updated_centroids - centroids)
+        print(f"Shift is {shift.item()}")
+        print(f"Dead centroids: {dead_mask.sum().item()}")
+        if shift < tol:
+            break
+        centroids = updated_centroids
+
+    # Move results to CPU and convert to NumPy
+    cluster_assignments_cpu = cluster_assignments.cpu().numpy()
+    centroids_cpu = centroids.cpu().numpy()
+    return cluster_assignments_cpu, centroids_cpu
+
+def our_kmeans_L2_TORCH_no_batching(N, D, A, K, num_streams, gpu_batch_num, max_iters, device="cuda"):
+    """
+    Optimized k-means clustering using L2 distance with batching and multiple CUDA streams in PyTorch.
     
     Args:
         N (int): Number of vectors.
@@ -344,11 +459,11 @@ if __name__ == "__main__":
         our_knn_L1_TORCH
     ]
 
-    kmeans_functions = [our_kmeans_L2_TORCH]
+    kmeans_functions = [our_kmeans_L2_TORCH, our_kmeans_L2_TORCH_no_batching]
 
     # Run tests
-    """ for func in knn_functions:
-        test_knn(func, N, D, A, X, K, repeat) """
+    for func in knn_functions:
+        test_knn(func, N, D, A, X, K, repeat)
     
     for func in kmeans_functions:
         test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)

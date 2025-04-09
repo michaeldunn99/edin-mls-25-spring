@@ -67,7 +67,7 @@ def distance_manhattan_TORCH(X, Y):
 # Task 1.2: Core kNN Function with Batching and Streams
 # ------------------------------------------------------------------------------------------------
 
-def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
+def our_knn_TORCH_no_batching(N, D, A, X, K, distance_func, device="cuda"):
     """
     Core k-Nearest Neighbors using PyTorch with a specified distance function, batching, and CUDA streams.
     
@@ -96,10 +96,7 @@ def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
 
     # Move query vector X to GPU once (shared across all streams)
     X = torch.as_tensor(X, dtype=torch.float32, device=device)
-
-    A_is_tensor = isinstance(A, torch.Tensor)
-    if A_is_tensor:
-        A = A.to(device=device, dtype=torch.float32)
+    A = torch.as_tensor(A, dtype=torch.float32, device=device)
 
     # Preallocate final distances array on GPU
     final_distances = torch.empty(N, dtype=torch.float32, device=device)
@@ -137,10 +134,7 @@ def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
     # Process each batch in its own stream
     for i, (start, end) in enumerate(gpu_batches):
         with torch.cuda.stream(streams[i]):
-            if A_is_tensor and A.device == device:
-                A_batch = A[start:end]
-            else:
-                A_batch = torch.as_tensor(A[start:end], dtype=torch.float32, device=device)
+            A_batch = A[start:end]
             distances = distance(A_batch)
             final_distances[start:end] = distances
 
@@ -152,6 +146,97 @@ def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
 
     # Convert to NumPy and return
     return top_k_indices.cpu().numpy()
+
+def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
+    """
+    Core k-Nearest Neighbors using PyTorch with a specified distance function, batching, and CUDA streams.
+    Assumes A is a NumPy array on CPU and batches are transferred to GPU on-demand.
+
+    Args:
+        N (int): Number of vectors
+        D (int): Dimension of vectors
+        A (np.ndarray): Collection of vectors [N, D] on CPU
+        X (np.ndarray or torch.Tensor): Query vector [D]
+        K (int): Number of nearest neighbors to find
+        distance_func (str): Distance function to use ("l2", "cosine", "dot", "l1")
+        device (str): Device to run on ("cuda")
+
+    Returns:
+        np.ndarray: Indices of the K nearest vectors [K]
+    """
+    if device != "cuda":
+        raise ValueError("This implementation requires a CUDA device for stream optimization.")
+
+    # Set up batching
+    gpu_batch_num = 32
+    stream_num = 4
+    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    # Create multiple CUDA streams
+    streams = [torch.cuda.Stream(device=device) for _ in range(stream_num)]
+
+    # Move query vector X to GPU once (shared across all streams)
+    X = torch.as_tensor(X, dtype=torch.float32, device=device)
+
+    # Preallocate GPU buffers per stream
+    A_device = [torch.empty((gpu_batch_size, D), dtype=torch.float32, device=device) for _ in range(stream_num)]
+
+    # Preallocate final distances array on GPU
+    final_distances = torch.empty(N, dtype=torch.float32, device=device)
+
+    # Vectorized distance functions
+    def l2(A_batch, X):
+        return torch.norm(A_batch - X, dim=1)
+
+    def cosine(A_batch, X_normalized):
+        norms_A = torch.norm(A_batch, dim=1, keepdim=True) + 1e-8
+        A_normalized = A_batch / norms_A
+        similarity = A_normalized @ X_normalized
+        return 1.0 - similarity
+
+    def dot(A_batch, X):
+        return -(A_batch @ X)
+
+    def l1(A_batch, X):
+        return torch.sum(torch.abs(A_batch - X), dim=1)
+
+    # Map distance functions to their vectorized versions
+    distance_to_vectorized = {
+        "l2": l2,
+        "cosine": cosine,
+        "dot": dot,
+        "l1": l1,
+    }
+
+    # Prepare the distance computation
+    if distance_func == "cosine":
+        X_normalized = X / (torch.norm(X) + 1e-8)
+        distance = lambda A_batch: distance_to_vectorized[distance_func](A_batch, X_normalized)
+    else:
+        distance = lambda A_batch: distance_to_vectorized[distance_func](A_batch, X)
+
+    # Process each batch in its own stream
+    for i, (start, end) in enumerate(gpu_batches):
+        stream = streams[i % stream_num]
+        A_buf = A_device[i % stream_num]
+        batch_size = end - start
+        with torch.cuda.stream(stream):
+            # Asynchronous copy from CPU to GPU
+            A_buf[:batch_size].copy_(torch.from_numpy(A[start:end]).to(device))
+            A_batch = A_buf[:batch_size]
+            distances = distance(A_batch)
+            final_distances[start:end] = distances
+
+    # Wait for all streams to complete
+    torch.cuda.synchronize(device=device)
+
+    # Perform top-K selection on GPU
+    top_k_indices = torch.topk(final_distances, K, largest=False, sorted=True)[1]
+
+    # Convert to NumPy and return
+    return top_k_indices.cpu().numpy()
+
 
 # Wrapper Functions for Each Distance Metric
 def our_knn_L2_TORCH(N, D, A, X, K):
@@ -169,6 +254,11 @@ def our_knn_dot_TORCH(N, D, A, X, K):
 def our_knn_L1_TORCH(N, D, A, X, K):
     """kNN with L1 (Manhattan) distance using PyTorch."""
     return our_knn_TORCH(N, D, A, X, K, "l1")
+
+def our_knn_L2_TORCH_no_batching(N, D, A, X, K):
+    """kNN with L2 distance using PyTorch without batching."""
+    return our_knn_TORCH_no_batching(N, D, A, X, K, "l2")
+
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.1 code here
@@ -537,23 +627,24 @@ if __name__ == "__main__":
     # List of kNN functions to test
     knn_functions = [
         our_knn_L2_TORCH,
+        our_knn_L2_TORCH_no_batching,
         our_knn_cosine_TORCH,
         our_knn_dot_TORCH,
         our_knn_L1_TORCH
     ]
 
     kmeans_functions = [our_kmeans_L2_TORCH_no_batching, our_kmeans_L2_TORCH]
-    cluster_assignments, centroids_gpu = our_kmeans_L2_TORCH(N, D, A, K, num_streams, gpu_batch_num, max_iters)
+    #cluster_assignments, centroids_gpu = our_kmeans_L2_TORCH(N, D, A, K, num_streams, gpu_batch_num, max_iters)
 
     ann_functions = [our_ann_l2_TORCH]
 
     # Run tests
-    """ for func in knn_functions:
-        test_knn(func, N, D, A, X, K, repeat) """
+    for func in knn_functions:
+        test_knn(func, N, D, A, X, K, repeat)
     
     """for func in kmeans_functions:
         test_kmeans(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)"""
     
-    if ann_functions:
+    """if ann_functions:
         for func in ann_functions:
-            test_ann_query_only(func, N, D, A, X, 10, repeat, cluster_assignments, centroids_gpu)
+            test_ann_query_only(func, N, D, A, X, 10, repeat, cluster_assignments, centroids_gpu)"""

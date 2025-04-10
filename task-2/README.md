@@ -67,9 +67,9 @@ Start the Autoscaler in a different terminal (defaults to 2 warm instances on po
 python autoscaler.py
 ```
 
-Test this system under varying input load via tests/test_end_to_end.py shown next.
+This system can be tested as described next.
 
-## Test all Systems
+## Testing
 Once you've started **one of the three systems** (Baseline, Queued-Batched, or Scaled-Balanced), you can test their performance using the provided script:
 ```bash
 python tests/test_end_to_end.py --mode ideal --target load_balancer_round_robin

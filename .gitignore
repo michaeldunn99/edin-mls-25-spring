@@ -34,3 +34,5 @@ coverage.*
 task-1/data/
 task-1/.ipynb_checkpoints/
 task-1/results.txt
+# Ignore all files and folders inside results_plots
+task-1/results_plots/

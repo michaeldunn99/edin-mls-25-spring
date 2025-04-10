@@ -39,7 +39,15 @@ chat_pipeline = pipeline("text-generation", model="facebook/opt-125m", device=0)
 # 2. Process the batched requests
 
 def get_embedding(text: str) -> np.ndarray:
-    """Compute a simple average-pool embedding."""
+    """
+    Computes an average-pool embedding for the given text using a pre-trained transformer model.
+
+    Args:
+        text (str): The input text for which to compute an embedding.
+
+    Returns:
+        np.ndarray: A NumPy array representing the averaged token embeddings of the input text.
+    """
     inputs = embed_tokenizer(text, return_tensors="pt", truncation=True).to("cuda")
     with torch.no_grad():
         outputs = embed_model(**inputs)
@@ -50,12 +58,36 @@ doc_embeddings = np.vstack([get_embedding(doc) for doc in documents])
 
 ### You may want to use your own top-k retrieval method (task 1)
 def retrieve_top_k(query_emb: np.ndarray, k: int = 2) -> list:
-    """Retrieve top-k docs via dot-product similarity."""
+    """
+    Retrieves the top-k most relevant documents by computing dot-product similarities
+    between the query embedding and precomputed document embeddings.
+
+    Args:
+        query_emb (np.ndarray): The embedding of the query text.
+        k (int, optional): The number of top documents to retrieve. Defaults to 2.
+
+    Returns:
+        list: A list of top-k documents (strings) retrieved from the in-memory collection.
+    """
     sims = doc_embeddings @ query_emb.T
     top_k_indices = np.argsort(sims.ravel())[::-1][:k]
     return [documents[i] for i in top_k_indices]
 
 def rag_pipeline(query: str, k: int = 2) -> str:
+    """
+    Implements a simple RAG (Retrieval-Augmented Generation) pipeline:
+    1. Embeds the input query.
+    2. Retrieves top-k documents.
+    3. Constructs a prompt with the query and retrieved documents.
+    4. Generates an answer using a text-generation model (LLM).
+
+    Args:
+        query (str): The user-provided query or question.
+        k (int, optional): The number of documents to retrieve. Defaults to 2.
+
+    Returns:
+        str: The generated response from the language model, containing context and answer.
+    """
     # Step 1: Input embedding
     query_emb = get_embedding(query)
     
@@ -77,6 +109,16 @@ class QueryRequest(BaseModel):
 
 @app.post("/rag")
 def predict(payload: QueryRequest):
+    """
+    Receives a query from the user, calls the RAG pipeline to generate an answer,
+    and returns the result as a JSON response.
+
+    Args:
+        payload (QueryRequest): A Pydantic model containing the query string and optional number of documents to retrieve.
+
+    Returns:
+        dict: A dictionary containing the user's query and the generated result.
+    """
     result = rag_pipeline(payload.query, payload.k)
     
     return {

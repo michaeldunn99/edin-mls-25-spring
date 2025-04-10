@@ -25,16 +25,35 @@ os.environ["CUDA_MPS_PIPE_DIRECTORY"] = "/tmp/nvidia-mps"
 os.environ["CUDA_MPS_LOG_DIRECTORY"] = "/tmp/nvidia-log"
 
 async def register_with_balancer(port):
+    """
+    Registers a backend instance with the load balancer by sending a POST request to the /register endpoint.
+
+    Args:
+        port (int): The port number where the backend instance is running.
+    """
     url = f"http://localhost:{port}"
     async with httpx.AsyncClient() as client:
         await client.post("http://localhost:9000/register", json={"url": url})
 
 async def unregister_from_balancer(port):
+    """
+    Unregisters a backend instance from the load balancer by sending a POST request to the /unregister endpoint.
+
+    Args:
+        port (int): The port number of the backend instance to be unregistered.
+    """
     url = f"http://localhost:{port}"
     async with httpx.AsyncClient() as client:
         await client.post("http://localhost:9000/unregister", json={"url": url})
 
 async def start_instance(port):
+    """
+    Starts a new backend instance if it is not already running. Sets up the environment for GPU usage and 
+    launches the serving script as a subprocess.
+
+    Args:
+        port (int): The port number on which to start the new backend instance.
+    """
     if port in processes:
         print(f"[Autoscaler] Instance on port {port} already running.")
         return
@@ -55,6 +74,12 @@ async def start_instance(port):
         print(f"[Autoscaler] Timeout: Instance on port {port} did not become ready.")
 
 async def stop_instance(port):
+    """
+    Terminates a running backend instance, waits for it to finish, and unregisters it from the load balancer.
+
+    Args:
+        port (int): The port number of the running backend instance to stop.
+    """
     proc = processes.get(port)
     if proc:
         proc.terminate()
@@ -64,6 +89,11 @@ async def stop_instance(port):
         await unregister_from_balancer(port)
 
 async def autoscaler_loop():
+    """
+    Main loop responsible for automatically scaling backend instances based on total requests per second (RPS).
+    Creates the initial instances, monitors incoming RPS, and scales up or down based on defined thresholds.
+    Continuously runs until the process is terminated.
+    """
     current_instances = MIN_INSTANCES
     for i in range(current_instances):
         port = BACKEND_BASE_PORT + i

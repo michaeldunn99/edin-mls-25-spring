@@ -18,7 +18,7 @@ Key components:
 - Load testing: `tests/test_end_to_end.py`
 
 ---
-## Environment Setup:
+## Environment Setup
 
 ```bash
 # Step 1: Create a Python environment

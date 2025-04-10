@@ -1,0 +1,16 @@
+# Parameters for testing
+- MAX_BATCH_SIZE = 10
+- MAX_WAIT_TIME = 0.5s
+- Total requests sent = 1000
+- REQUEST_RATES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+- TIMEOUT (Time allowed for responses to be generated, test_end_to_end.py)= 60.0
+- POISSON_SEED = 42
+- K = 2
+- QUERY = "Which animals can hover in the air?"
+- MAX INSTANCES (AUTOSCALER) = 3
+- MIN INSTANCES (AUTOSCALER) = 2 (keeping one warm instance)
+- CHECK INTERVAL (AUTOSCALER) = 5
+- SCALE_UP_THRESHOLD (AUTOSCALER)= 29.0   # RPS
+- SCALE_DOWN_THRESHOLD (AUTOSCALER) = 25.0  # RPS
+- SCALE_UP_COOLDOWN (AUTOSCALER) = 30     # seconds
+- SCALE_DOWN_COOLDOWN (AUTOSCALER) = 120  # seconds

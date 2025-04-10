@@ -29,3 +29,8 @@ __pycache__/
 .hypothesis/
 .tox/
 coverage.*
+
+# Test results for Task-2
+test_results/*
+!test_results/plot_results.py
+!test_results/README.md

@@ -7,9 +7,9 @@ This project implements an end-to-end LLM-serving system that includes a request
 ![system_overview](https://github.com/user-attachments/assets/8ab21228-b570-4570-a66c-bfe0eac1ee8b)
 
 There are three system designs:
-1. **Baseline** (no batching, no queue)
-2. **Queued-Batched Design**
-3. **Scaled-Balanced Design** (load balancer + autoscaler)
+1. **Baseline** (no queue, batching, load balancer or autoscaler)
+2. **Queued-Batched Design** (no load balancer or autoscaler)
+3. **Scaled-Balanced Design** (as per illustration above)
 
 Key components:
 - Embedding model: `intfloat/multilingual-e5-large-instruct`

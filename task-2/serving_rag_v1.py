@@ -41,6 +41,15 @@ chat_pipeline = pipeline("text-generation", model="facebook/opt-125m", device=0)
 
 # Compute average-pool embeddings
 def get_embedding_batch(texts: list[str]) -> np.ndarray:
+    """
+    Computes average-pool embeddings for a batch of input texts using the pre-trained model.
+    
+    Args:
+        texts (list[str]): A list of input strings for which embeddings will be computed.
+
+    Returns:
+        np.ndarray: A NumPy array of shape (batch_size, embedding_dim) containing the embeddings for all inputs.
+    """
     inputs = embed_tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to("cuda")
     with torch.no_grad():
         outputs = embed_model(**inputs)
@@ -51,6 +60,16 @@ doc_embeddings = np.vstack([get_embedding_batch([doc]) for doc in documents])
 
 # Retrieve top-k documents via dot-product
 def retrieve_top_k_batch(query_embs: np.ndarray, k_list: list[int]) -> list[list[str]]:
+    """
+    Retrieves the top-k most relevant documents for each query in the batch based on dot-product similarity.
+    
+    Args:
+        query_embs (np.ndarray): A NumPy array of shape (batch_size, embedding_dim) containing query embeddings.
+        k_list (list[int]): A list of k values, one per query, indicating how many documents to retrieve.
+
+    Returns:
+        list[list[str]]: A list of lists, where each sub-list contains the top-k documents for the corresponding query.
+    """
     batch_results = []
     for emb, k in zip(query_embs, k_list):
         sims = doc_embeddings @ emb.T
@@ -67,6 +86,14 @@ class QueryRequest(BaseModel):
 
 # Background worker thread for batching requests
 def batch_worker():
+    """
+    Continuously retrieves requests from the global request queue in batches. 
+    Generates responses by embedding queries, retrieving relevant documents, 
+    and passing them to the text generation pipeline. The results are placed 
+    into individual response queues corresponding to each request.
+    
+    This function runs as a daemon thread and only exits when the application terminates.
+    """
     while True:
         batch = request_queue.get_batch(MAX_BATCH_SIZE, MAX_WAIT_TIME)
         if not batch:
@@ -111,6 +138,17 @@ Thread(target=batch_worker, daemon=True).start()
 
 @app.post("/rag")
 def predict(payload: QueryRequest):
+    """
+    Handles a RAG (Retrieval-Augmented Generation) request. Assigns a unique ID to each request 
+    and places it into the global queue for batched processing. Waits for the batch worker 
+    to generate a response, then returns the result.
+
+    Args:
+        payload (QueryRequest): The query payload, including the user query string and the number of documents (k).
+
+    Returns:
+        dict: A JSON-compatible dictionary containing the user's query and the generated answer.
+    """
     # Generate a unique request ID for the payload.
     payload._id = f"req_{uuid.uuid4()}"  # Set internal ID here
 

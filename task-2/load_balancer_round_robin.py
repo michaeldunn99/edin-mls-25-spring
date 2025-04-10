@@ -24,7 +24,20 @@ app = FastAPI()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Provides a lifespan context for the FastAPI application. Initialises and starts the reset loop 
+    that calculates RPS and resets counters periodically.
+    
+    Args:
+        app (FastAPI): The FastAPI application instance.
+    Yields:
+        None: The context manager yields control to the application lifespan.
+    """
     async def reset_loop():
+        """
+        Periodically resets the tracking metrics for each backend. Calculates requests per second (RPS) 
+        and updates shared state accordingly.
+        """
         global last_reset
         while True:
             await asyncio.sleep(reset_interval)
@@ -51,6 +64,15 @@ class BackendRequest(BaseModel):
 
 @app.post("/register")
 async def register_backend(request: BackendRequest):
+    """
+    Registers a new backend by adding its URL to the BACKENDS list, if it is not already present.
+    
+    Args:
+        request (BackendRequest): A request body containing the URL of the backend.
+    
+    Returns:
+        dict: A JSON response indicating the registration status of the backend.
+    """
     async with backend_lock:
         if request.url not in BACKENDS:
             BACKENDS.append(request.url)
@@ -59,6 +81,15 @@ async def register_backend(request: BackendRequest):
 
 @app.post("/unregister")
 async def unregister_backend(request: BackendRequest):
+    """
+    Unregisters a backend by removing its URL from the BACKENDS list, if present.
+    
+    Args:
+        request (BackendRequest): A request body containing the URL of the backend to remove.
+    
+    Returns:
+        dict: A JSON response indicating the unregistration status of the backend.
+    """
     async with backend_lock:
         if request.url in BACKENDS:
             BACKENDS.remove(request.url)
@@ -67,6 +98,13 @@ async def unregister_backend(request: BackendRequest):
 
 @app.get("/assign")
 async def assign_backend():
+    """
+    Assigns the next available backend to a request using a simple round-robin scheme. 
+    Increments the request count for the chosen backend.
+    
+    Returns:
+        dict: A JSON response containing the assigned backend's URL or an error if no backends are available.
+    """
     global backend_index
     async with backend_lock:
         if not BACKENDS:
@@ -80,6 +118,15 @@ async def assign_backend():
 
 @app.get("/metrics")
 async def get_metrics():
+    """
+    Returns metrics about the current backends, including:
+    - The interval over which RPS is calculated (in seconds).
+    - The RPS values stored for each backend.
+    - The list of registered backends.
+    
+    Returns:
+        dict: A JSON response containing interval_seconds, rps, and backend_list.
+    """
     return {
         "interval_seconds": reset_interval,
         "rps": stored_rps,

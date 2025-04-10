@@ -4,12 +4,25 @@ from threading import Lock
 
 class RequestQueue:
     def __init__(self):
-        # FIFO queue to store requests
+        """
+        Initializes a new instance of RequestQueue.
+        
+        Creates a FIFO queue to store requests and initializes a threading lock 
+        to synchronize access to the queue.
+        """
         self.queue = deque()
         self.lock = Lock()
 
     def add_request(self, request):
-        """Adds a request to the queue with the current timestamp."""
+        """
+        Adds a request to the queue with the current timestamp.
+
+        Args:
+            request: The request object to add to the queue.
+
+        Returns:
+            bool: True if the request is successfully added to the queue.
+        """
         # Ensuring that only one thread can modify the queue at a time
         with self.lock:
             # Add the request to the queue with the current timestamp
@@ -19,10 +32,18 @@ class RequestQueue:
         
     def get_batch(self, MAX_BATCH_SIZE, MAX_WAIT_TIME, now=None):
         """
-        Return a batch of requests when one of the conditions is met:
-        - The batch size reaches MAX_BATCH_SIZE
-        - The wait time exceeds MAX_WAIT_TIME
+        Retrieves a batch of requests subject to one of the following conditions:
+        - The queue contains at least MAX_BATCH_SIZE requests.
+        - The first request in the queue has waited for at least MAX_WAIT_TIME seconds.
 
+        Args:
+            MAX_BATCH_SIZE (int): The maximum number of requests to include in the batch.
+            MAX_WAIT_TIME (int): The maximum time (in seconds) to wait before returning a batch.
+            now (float, optional): The current timestamp. If None, the system time is used.
+
+        Returns:
+            list: A list of (timestamp, request) tuples representing the batch of requests. 
+                  Returns an empty list if neither condition is met.
         """
         now = now or time.time()
         batch = []

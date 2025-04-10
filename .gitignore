@@ -29,3 +29,8 @@ __pycache__/
 .hypothesis/
 .tox/
 coverage.*
+
+#Task-1 data
+task-1/data/
+task-1/.ipynb_checkpoints/
+task-1/results.txt

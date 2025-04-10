@@ -1,11 +1,12 @@
 # Task 2
 
-A modular FastAPI-based RAG (Retrieval-Augmented Generation) pipeline demonstrating a progression from a baseline implementation to a production-style deployment with batching, load balancing, and autoscaling.
-
+A modular FastAPI-based LLM-serving system that combines document retrieval with text generation, demonstrating a progression from a baseline impelemntation to a production-style deployment with batching, load balancing, and autoscaling.
 
 ## Overview
-This project implements an end-to-end RAG system that retrieves relevant documents and generates answers using a large language model (LLM). It progresses through:
+This project implements an end-to-end LLM-serving system that includes a request queue, batcher, load balancer and autoscaler as per the illustration below:
+![system_overview](https://github.com/user-attachments/assets/8ab21228-b570-4570-a66c-bfe0eac1ee8b)
 
+There are three system designs:
 1. **Baseline** (no batching, no queue)
 2. **Queued-Batched Design**
 3. **Scaled-Balanced Design** (load balancer + autoscaler)
@@ -53,6 +54,9 @@ curl -X POST "http://localhost:8000/rag" -H "Content-Type: application/json" -d 
 ```
 
 ## Running the Scaled-Balanced Design
+**Note:**  
+It is important to start the load balancer before the autoscaler, as there system can't start if the autoscaler is started first and tries to register the instances with the load balancer that hasn't been started yet.
+
 Start the load balancer in one terminal. This listens at port ```http://localhost:9000```
 ```bash
 python load_balancer_round_robin.py

@@ -6,25 +6,21 @@ import random
 import argparse
 from statistics import mean, median, quantiles
 from typing import List
-
+import traceback
 # --- Logical endpoints mapped to actual URLs ---
 TARGET_ENDPOINTS = {
     "original": "http://localhost:8000/rag",
-    "load_balancer_round_robin": "http://localhost:9000/rag"
+    "load_balancer_round_robin": "http://localhost:9000/assign"
 }
 
 # --- Global config ---
 QUERY = "Which animals can hover in the air?"
-# Number of documents to retrieve
 K = 2
-# RPS to test
-REQUEST_RATES = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-# Total number of requests to send at each RPS
-REQUESTS_PER_RATE = 200
-# Timeout for each request. This is the maximum time to wait for a response. Also allows time for the server to respond, important for measuring tail latencies.
-TIMEOUT = 50.0
+REQUEST_RATES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+REQUESTS_PER_RATE = 1000
+TIMEOUT = 60.0
 CSV_FILENAME = "end_to_end_results.csv"
-POISSON_SEED = 42  # For reproducibility
+POISSON_SEED = 42
 
 # --- Result container ---
 class RequestResult:
@@ -33,18 +29,30 @@ class RequestResult:
         self.status_code = status_code
 
 # --- Send one request ---
-async def send_request(client: httpx.AsyncClient, session_id: int, endpoint: str) -> RequestResult:
+async def send_request(client: httpx.AsyncClient, session_id: int, endpoint: str, target: str) -> RequestResult:
     payload = {"query": QUERY, "k": K}
     start = time.time()
     try:
-        response = await client.post(endpoint, json=payload)
+        if target == "load_balancer_round_robin":
+            assign_resp = await client.get(endpoint)
+            assigned_backend = assign_resp.json().get("backend")
+            #print(f"[DEBUG] Assigned backend: {assigned_backend}")
+            if not assigned_backend:
+                raise ValueError("No backend assigned.")
+            response = await client.post(assigned_backend, json=payload)
+        else:
+            #print(f"[DEBUG] Sending POST to: {assigned_backend}")
+            response = await client.post(endpoint, json=payload)
+
         latency = time.time() - start
         return RequestResult(latency, response.status_code)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Request failed: {e}")
+        traceback.print_exc()
         return RequestResult(latency=float('inf'), status_code=0)
 
 # --- Run test at given RPS ---
-async def run_test_at_rps(rps: int, mode: str, endpoint: str) -> List[RequestResult]:
+async def run_test_at_rps(rps: int, mode: str, endpoint: str, target: str) -> List[RequestResult]:
     if mode == "poisson":
         random.seed(POISSON_SEED)
 
@@ -52,7 +60,7 @@ async def run_test_at_rps(rps: int, mode: str, endpoint: str) -> List[RequestRes
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         tasks = []
         for i in range(REQUESTS_PER_RATE):
-            tasks.append(asyncio.create_task(send_request(client, i, endpoint)))
+            tasks.append(asyncio.create_task(send_request(client, i, endpoint, target)))
 
             if mode == "ideal":
                 interval = 1 / rps
@@ -67,7 +75,7 @@ async def run_test_at_rps(rps: int, mode: str, endpoint: str) -> List[RequestRes
     return results
 
 # --- Compute latency and throughput stats ---
-def compute_metrics(results: List[RequestResult]):
+def compute_metrics(results: List[RequestResult], wall_time: float):
     latencies = [r.latency for r in results if r.status_code == 200]
     failed = [r for r in results if r.status_code != 200]
 
@@ -80,7 +88,7 @@ def compute_metrics(results: List[RequestResult]):
         "p90_latency": quantiles(latencies, n=10)[8] if len(latencies) >= 10 else None,
         "p95_latency": quantiles(latencies, n=20)[18] if len(latencies) >= 20 else None,
         "p99_latency": quantiles(latencies, n=100)[98] if len(latencies) >= 100 else None,
-        "throughput_rps": len(latencies) / sum(latencies) if latencies else 0
+        "throughput_rps": len(latencies) / wall_time
     }
     return stats
 
@@ -111,8 +119,10 @@ async def main(mode: str, target: str):
     all_results = {}
     for rps in REQUEST_RATES:
         print(f"\n=== Testing at {rps} RPS ({mode} mode) ===")
-        results = await run_test_at_rps(rps, mode, endpoint)
-        stats = compute_metrics(results)
+        start_time = time.time()
+        results = await run_test_at_rps(rps, mode, endpoint, target)
+        wall_time = time.time() - start_time
+        stats = compute_metrics(results, wall_time)
 
         for key, value in stats.items():
             print(f"{key}: {value}")
@@ -120,6 +130,7 @@ async def main(mode: str, target: str):
         
         print("Waiting for cooldown before next RPS test...")
         await asyncio.sleep(50)  # Cooldown delay
+
 
     save_results_to_csv(all_results, mode, target)
     print(f"\n Results saved to: {target}_{mode}_{CSV_FILENAME}")

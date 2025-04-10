@@ -10,6 +10,7 @@ import os
 import time
 from request_queue import RequestQueue
 import uvicorn
+import uuid
 
 ################################ VERSION WITH REQUEST QUEUE AND BATCHER ################################
 
@@ -17,7 +18,7 @@ app = FastAPI()
 
 # Constants for batching
 MAX_BATCH_SIZE = 10
-MAX_WAIT_TIME = 1  # seconds
+MAX_WAIT_TIME = 0.5  # seconds
 
 # Global request queue
 request_queue = RequestQueue()
@@ -31,16 +32,16 @@ documents = [
 ]
 
 # Load embedding model
-EMBED_MODEL_NAME = "/home/s2706676/rag_models/e5-large-instruct"
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
 embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
-embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME)
+embed_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to("cuda")
 
 # Load text generation model
-chat_pipeline = pipeline("text-generation", model="/home/s2706676/rag_models/opt-125m")
+chat_pipeline = pipeline("text-generation", model="facebook/opt-125m", device=0)
 
 # Compute average-pool embeddings
 def get_embedding_batch(texts: list[str]) -> np.ndarray:
-    inputs = embed_tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+    inputs = embed_tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to("cuda")
     with torch.no_grad():
         outputs = embed_model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
@@ -72,30 +73,38 @@ def batch_worker():
             # If there is no batch, sleep for a short time before checking again
             time.sleep(0.01)
             continue
-        # Extract the queries, ks, and ids from the batch
-        requests = [item[1] for item in batch]
 
-        queries = [req.query for req in requests]
-        ks = [req.k for req in requests]
-        ids = [req._id for req in requests]
+        try:
+            # Extract the queries, ks, and ids from the batch
+            requests = [item[1] for item in batch]
+            queries = [req.query for req in requests]
+            ks = [req.k for req in requests]
+            ids = [req._id for req in requests]
 
-        # Get the embeddings for the queries and retrieve the top-k documents for each query
-        query_embs = get_embedding_batch(queries)
-        retrieved_docs_batch = retrieve_top_k_batch(query_embs, ks)
+            # Get the embeddings for the queries and retrieve the top-k documents
+            query_embs = get_embedding_batch(queries)
 
-        # Create prompts for the chat model
-        prompts = [
-            f"Question: {query}\nContext:\n{chr(10).join(docs)}\nAnswer:"
-            for query, docs in zip(queries, retrieved_docs_batch)
-        ]
+            retrieved_docs_batch = retrieve_top_k_batch(query_embs, ks)
 
-        # Passes all the prompts together to the chat model
-        generations = chat_pipeline(prompts, max_length=50, do_sample=True)
-        results = [g[0]["generated_text"] for g in generations]
+            # Create prompts for the chat model
+            prompts = [
+                f"Question: {query}\nContext:\n{chr(10).join(docs)}\nAnswer:"
+                for query, docs in zip(queries, retrieved_docs_batch)
+            ]
 
+            # Generate responses
+            generations = chat_pipeline(prompts, max_length=50, do_sample=True)
 
-        for req_id, result in zip(ids, results):
-            response_queues[req_id].put(result)
+            results = [g[0]["generated_text"] for g in generations]
+
+            for req_id, result in zip(ids, results):
+                response_queues[req_id].put(result)
+
+        except Exception as e:
+            print(f"[Batch Worker ERROR] Chat generation failed: {e}")
+            for req_id in ids:
+                response_queues[req_id].put(f"Generation failed: {str(e)}")
+
 
 # Launch background batch processing thread
 Thread(target=batch_worker, daemon=True).start()
@@ -103,7 +112,7 @@ Thread(target=batch_worker, daemon=True).start()
 @app.post("/rag")
 def predict(payload: QueryRequest):
     # Generate a unique request ID for the payload.
-    payload._id = f"req_{time.time_ns()}"  # Set internal ID here
+    payload._id = f"req_{uuid.uuid4()}"  # Set internal ID here
 
     resp_q = Queue()
     response_queues[payload._id] = resp_q
@@ -111,7 +120,11 @@ def predict(payload: QueryRequest):
     # Add the request to the request queue
     request_queue.add_request(payload)
 
-    result = resp_q.get()
+    try:
+        result = resp_q.get()  # seconds
+    except Exception as e:
+        print(f"[{os.environ.get('PORT')}] Timeout or error in response queue: {e}")
+        return {"error": "Timeout waiting for batch response"}
     del response_queues[payload._id]
 
     return {
@@ -121,4 +134,5 @@ def predict(payload: QueryRequest):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -34,3 +34,8 @@ coverage.*
 test_results/*
 !test_results/plot_results.py
 !test_results/README.md
+
+#Task-1 data
+task-1/data/
+task-1/.ipynb_checkpoints/
+task-1/results.txt

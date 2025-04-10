@@ -24,24 +24,21 @@ class HNSW(object):
     def _distance(self, x, y):
         return self.distance_func(x, [y])[0]
 
-    def vectorized_distance_(self, x, ys):
-        return [self.distance_func(x, y) for y in ys]
-
-    def __init__(self, distance_type, m=5, ef=200, m0=None, heuristic=True, vectorized=False):
-        self.data = []
+    def __init__(self, distance_type, dim, m=5, ef=200, m0=None, heuristic=True, vectorized=False):
+        """Initialize HNSW with vector dimension."""
+        self.data = np.empty((0, dim), dtype=np.float32)  # Store data as NumPy array
+        self.distance_type = distance_type
         if distance_type == "l2":
-            distance_func = self.l2_distance
+            self.distance_func = self.l2_distance
+            # Vectorized L2 distance: ||ys - x||_2 for all ys
+            self.vectorized_distance = lambda x, indices: np.linalg.norm(self.data[indices] - x, axis=1)
         elif distance_type == "cosine":
-            distance_func = self.cosine_distance
+            self.distance_func = self.cosine_distance
+            # Vectorized cosine distance with epsilon to avoid division by zero
+            self.vectorized_distance = lambda x, indices: 1 - (np.dot(self.data[indices], x) / 
+                (np.linalg.norm(x) * (np.linalg.norm(self.data[indices], axis=1) + 1e-10)))
         else:
             raise TypeError('Please check your distance type!')
-        self.distance_func = distance_func
-        if vectorized:
-            self.distance = self._distance
-            self.vectorized_distance = distance_func
-        else:
-            self.distance = distance_func
-            self.vectorized_distance = self.vectorized_distance_
         self._m = m
         self._ef = ef
         self._m0 = 2 * m if m0 is None else m0
@@ -49,18 +46,21 @@ class HNSW(object):
         self._graphs = []
         self._enter_point = None
         self._select = self._select_heuristic if heuristic else self._select_naive
+        self.dim = dim
 
     def add(self, elem, ef=None):
+        """Add a single vector to the index."""
         if ef is None:
             ef = self._ef
-        distance = self.distance
+        distance = self.distance_func  # Use single-pair distance function
         data = self.data
         graphs = self._graphs
         point = self._enter_point
         m = self._m
         level = int(-log2(random()) * self._level_mult) + 1
         idx = len(data)
-        data.append(elem)
+        # Append the new vector to self.data
+        self.data = np.concatenate((self.data, elem[None, :]), axis=0)
         if point is not None:
             dist = distance(elem, data[point])
             for layer in reversed(graphs[level:]):
@@ -78,46 +78,23 @@ class HNSW(object):
             graphs.append({idx: {}})
             self._enter_point = idx
 
-    def balanced_add(self, elem, ef=None):
+    def add_batch(self, elements, ef=None):
+        """Add multiple vectors to the index efficiently."""
         if ef is None:
             ef = self._ef
-        distance = self.distance
-        data = self.data
-        graphs = self._graphs
-        point = self._enter_point
-        m = self._m
-        m0 = self._m0
-        idx = len(data)
-        data.append(elem)
-        if point is not None:
-            dist = distance(elem, data[point])
-            pd = [(point, dist)]
-            for layer in reversed(graphs[1:]):
-                point, dist = self._search_graph_ef1(elem, point, dist, layer)
-                pd.append((point, dist))
-            for level, layer in enumerate(graphs):
-                level_m = m0 if level == 0 else m
-                candidates = self._search_graph(elem, [(-dist, point)], layer, ef)
-                layer[idx] = layer_idx = {}
-                self._select(layer_idx, candidates, level_m, layer, heap=True)
-                for j, dist in layer_idx.items():
-                    self._select(layer[j], (idx, dist), level_m, layer)
-                    assert len(layer[j]) <= level_m
-                if len(layer_idx) < level_m:
-                    return
-                if level < len(graphs) - 1:
-                    if any(p in graphs[level + 1] for p in layer_idx):
-                        return
-                point, dist = pd.pop()
-        graphs.append({idx: {}})
-        self._enter_point = idx
-
+        if not isinstance(elements, np.ndarray) or elements.dtype != np.float32 or elements.shape[1] != self.dim:
+            raise ValueError("Input must be a NumPy array of shape (N, dim) with dtype float32")
+        
+        for elem in elements:
+            self.add(elem, ef)
+    
     def search(self, q, k=None, ef=None):
-        distance = self.distance
-        graphs = self._graphs
-        point = self._enter_point
+        """Find k nearest neighbors to the query vector."""
         if ef is None:
             ef = self._ef
+        distance = self.distance_func
+        graphs = self._graphs
+        point = self._enter_point
         if point is None:
             raise ValueError("Empty graph")
         dist = distance(q, self.data[point])
@@ -131,8 +108,7 @@ class HNSW(object):
         return [(idx, -md) for md, idx in ep]
 
     def _search_graph_ef1(self, q, entry, dist, layer):
-        vectorized_distance = self.vectorized_distance
-        data = self.data
+        """Search with vectorized distance computation."""
         best = entry
         best_dist = dist
         candidates = [(dist, entry)]
@@ -144,7 +120,8 @@ class HNSW(object):
             edges = [e for e in layer[c] if e not in visited]
             if edges:
                 visited.update(edges)
-                dists = vectorized_distance(q, [data[e] for e in edges])
+                # Compute distances to all neighbors at once
+                dists = self.vectorized_distance(q, edges)
                 for e, dist in zip(edges, dists):
                     if dist < best_dist:
                         best = e
@@ -153,8 +130,7 @@ class HNSW(object):
         return best, best_dist
 
     def _search_graph(self, q, ep, layer, ef):
-        vectorized_distance = self.vectorized_distance
-        data = self.data
+        """Search with vectorized distance computation."""
         candidates = [(-mdist, p) for mdist, p in ep]
         heapify(candidates)
         visited = set(p for _, p in ep)
@@ -166,7 +142,8 @@ class HNSW(object):
             edges = [e for e in layer[c] if e not in visited]
             if edges:
                 visited.update(edges)
-                dists = vectorized_distance(q, [data[e] for e in edges])
+                # Compute distances to all neighbors at once
+                dists = self.vectorized_distance(q, edges)
                 for e, dist in zip(edges, dists):
                     mdist = -dist
                     if len(ep) < ef:
@@ -363,7 +340,7 @@ def our_knn_L2_CUPY(N, D, A, X, K):
 
 if __name__ == "__main__":
     # Parameters
-    N = 100000
+    N = 50000
     D = 256
     K = 10
     num_clusters = 600
@@ -384,10 +361,9 @@ if __name__ == "__main__":
 
     # Precompute HNSW index
     print("Building HNSW index...")
-    hnsw_cpu = HNSW(distance_type='l2', m=5, ef=ef)
+    hnsw_cpu = HNSW(distance_type='l2', dim=D, m=5, ef=ef)
     start_time = time.time()
-    for i in range(N):
-        hnsw_cpu.add(data[i])
+    hnsw_cpu.add_batch(data)
     hnsw_build_time = time.time() - start_time
     print(f"HNSW Build Time: {hnsw_build_time:.4f} seconds")
 

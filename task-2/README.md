@@ -1,65 +1,84 @@
 # Task 2
 
-A FastAPI-based Retrieval-Augmented Generation (RAG) service that combines document retrieval with text generation.
+A modular FastAPI-based RAG (Retrieval-Augmented Generation) pipeline demonstrating a progression from a baseline implementation to a production-style deployment with batching, load balancing, and autoscaling.
 
-## Step 1:
 
-1. Create a conda environment with the requirements.txt file
+## Overview
+This project implements an end-to-end RAG system that retrieves relevant documents and generates answers using a large language model (LLM). It progresses through:
 
-TIP: Check [this example](https://github.com/ServerlessLLM/ServerlessLLM/blob/main/docs/stable/getting_started/slurm_setup.md) for how to use slurm to create a conda environment.
+1. **Baseline** (no batching, no queue)
+2. **Queued-Batched Design**
+3. **Scaled-Balanced Design** (load balancer + autoscaler)
+
+Key components:
+- Embedding model: `intfloat/multilingual-e5-large-instruct`
+- Generator model: `facebook/opt-125m` (or `Qwen/Qwen2.5-1.5B-Instruct` if resources allow)
+- Web API: FastAPI
+- Load testing: `tests/test_end_to_end.py`
+
+---
+## Environment Setup:
 
 ```bash
+# Step 1: Create a Python environment
 conda create -n rag python=3.10 -y
 conda activate rag
-```
 
-```bash
+# Step 2: Clone repository and install requirements
 git clone https://github.com/ed-aisys/edin-mls-25-spring.git
 cd edin-mls-25-spring/task-2
 pip install -r requirements.txt
 ```
 
-2. Run the service
-
+## Running the Baseline Design
+Start the Baseline system
 ```bash
-python serving_rag.py
+python serving_rag_v0.py
 ```
 
-3. Test the service
-
+Query the Baseline system
 ```bash
 curl -X POST "http://localhost:8000/rag" -H "Content-Type: application/json" -d '{"query": "Which animals can hover in the air?"}'
 ```
 
-**Note:**  
-If you encounter issues while downloading model checkpoints on a GPU machine, try the following workaround:  
-
-1. Manually download the model on the host machine:  
-
+## Running the Queued-Batched Design
+Start the Queued-Batched system
 ```bash
-conda activate rag
-huggingface-cli download <model_name>
+python serving_rag_v1.py
 ```
 
-## Step 2:
+Query the Queued-Batched system
+```bash
+curl -X POST "http://localhost:8000/rag" -H "Content-Type: application/json" -d '{"query": "Which animals can hover in the air?"}'
+```
 
-1. Create a new script (bash or python) to test the service with different request rates. A reference implementation is [TraceStorm](https://github.com/ServerlessLLM/TraceStorm)
+## Running the Scaled-Balanced Design
+Start the load balancer in one terminal. This listens at port ```http://localhost:9000```
+```bash
+python load_balancer_round_robin.py
+```
 
-## Step 3:
+Start the Autoscaler in a different terminal (defaults to 2 warm instances on ports ```http://localhost:8000``` and ```http://localhost:8001```). This spawns two backend instances of ```serving_rag_v1.py```, scaling as the input load scales.
+```bash
+python autoscaler.py
+```
 
-1. Implement a request queue to handle concurrent requests
+Test this system under varying input load via tests/test_end_to_end.py shown next.
 
-A potential design:
-Create a request queue
-Put incoming requests into the queue, instead of directly processing them
-Start a background thread that listens on the request queue
+## Test all Systems
+Once you've started **one of the three systems** (Baseline, Queued-Batched, or Scaled-Balanced), you can test their performance using the provided script:
+```bash
+python tests/test_end_to_end.py --mode ideal --target load_balancer_round_robin
+```
 
-2. Implement a batch processing mechanism
+### CLI Options
 
-Take up to MAX_BATCH_SIZE requests from the queue or wait until MAX_WAITING_TIME
-Process the batched requests
+| Argument     | Description                                                                 |
+|--------------|-----------------------------------------------------------------------------|
+| `--mode`     | Type of request arrival. Options: `ideal`, `poisson`.     |
+| `--target`   | Endpoints, for testing Baseline or Queued-Batched use original, for testing Scaled-Balanced use load_balancer_round_robin: `original`, `load_balancer_round_robin`. |
 
 
-3. Measure the performance of the optimized system compared to the original service
+**Note:**  
+Wait for the backends to spin-up after starting the autoscaler before running the test file. 
 
-4. Draw a conclusion

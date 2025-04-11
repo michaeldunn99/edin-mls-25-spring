@@ -3,6 +3,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import glob
 
+# === Global Font Settings ===
+plt.rcParams["font.family"] = "Times New Roman"
+plt.rcParams["xtick.labelsize"] = 16
+plt.rcParams["ytick.labelsize"] = 16
+plt.rcParams["legend.fontsize"] = 16
+
 # === Part 1: Plot Ideal Results for Different System Versions ===
 
 csv_files = glob.glob("*_ideal_end_to_end_results.csv")
@@ -31,7 +37,6 @@ for metric, (ylabel, filename) in metrics.items():
                  color=colors[idx % len(colors)], 
                  marker=markers[idx % len(markers)])
     
-    # Set axis ticks in 5s
     plt.xlim(0, 60)
     plt.ylim(0, 60)
     plt.xticks(np.arange(0, 61, 5))
@@ -40,7 +45,6 @@ for metric, (ylabel, filename) in metrics.items():
     plt.title(f"{ylabel} vs Input RPS - Ideal Arrival Pattern", fontsize=18)
     plt.xlabel("Input (RPS)", fontsize=16)
     plt.ylabel(ylabel, fontsize=16)
-    plt.tick_params(axis='both', labelsize=12)
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -69,18 +73,16 @@ for metric, (ylabel, filename) in bar_metrics.items():
     plt.bar(x - bar_width/2, df_ideal[metric], width=bar_width, label="Ideal Arrival", color="tab:blue")
     plt.bar(x + bar_width/2, df_poisson[metric], width=bar_width, label="Poisson Arrival", color="tab:orange")
 
-    # Set axis ticks in 5s
     y_min = 0
     y_max = max(df_ideal[metric].max(), df_poisson[metric].max())
     plt.yticks(np.arange(y_min, np.ceil(y_max) + 1, 5))
 
-    plt.title(f"Final Design - {ylabel} vs Input RPS - Ideal vs Poisson", fontsize=18)
+    plt.title(f"Scaled-Batched - {ylabel} vs Input RPS - Ideal vs Poisson", fontsize=18)
     plt.xlabel("Input RPS", fontsize=16)
     plt.ylabel(ylabel, fontsize=16)
-    plt.xticks(x, rps_values, fontsize=12)
-    plt.tick_params(axis='y', labelsize=12)
-    plt.legend(fontsize=14)
+    plt.xticks(x, rps_values)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.close()

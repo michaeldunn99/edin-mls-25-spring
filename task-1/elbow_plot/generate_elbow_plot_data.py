@@ -1,6 +1,7 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import cupy as cp
+import pandas as pd
+import os
 
 def our_kmeans_cosine_elbow(N, D, A, K, return_loss=False):
     max_iters = 20
@@ -191,11 +192,10 @@ def our_kmeans_L2_elbow(N, D, A, K, return_loss=False):
 
     return cluster_assignments
 
-def generate_elbow_plot(N=480_000, D=1024, K_values=None, seed=42): # Change D back to 1024 for proper testing
+def run_kmeans_and_save_losses(N=480_000, D=1024, K_values=None, seed=42, out_csv="elbow_losses.csv"):
     if K_values is None:
-        K_values = list(range(1, 1000, 100))  # Test K = 2 to 15
+        K_values = list(range(1, 1000, 100))
 
-    # Set random seed for reproducibility
     np.random.seed(seed)
     print(f"Generating synthetic dataset: N={N}, D={D}")
     A = np.random.randn(N, D).astype(np.float32)
@@ -214,32 +214,16 @@ def generate_elbow_plot(N=480_000, D=1024, K_values=None, seed=42): # Change D b
         _, loss_cosine = our_kmeans_cosine_elbow(N, D, A, K, return_loss=True)
         losses_cosine.append(loss_cosine)
 
-    # --------------------------
-    # Plot for L2 distance only
-    # --------------------------
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(K_values, losses_L2, marker='o', color='blue')
-    plt.xlabel("Number of Clusters (K)", fontsize=16)
-    plt.ylabel("L2 Clustering Loss", fontsize=16)
-    plt.title("Elbow Plot for KMeans with L2 Distance", fontsize=18)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("elbow_plot_L2.png")
-    plt.show()
+    # Save results to elbow_plot/elbow_losses.csv
+    out_path = os.path.join(os.path.dirname(__file__), out_csv)
+    df = pd.DataFrame({
+        "K": K_values,
+        "loss_L2": losses_L2,
+        "loss_cosine": losses_cosine
+    })
+    df.to_csv(out_path, index=False)
+    print(f"\nSaved results to {out_path}")
 
-    # -----------------------------
-    # Plot for Cosine distance only
-    # -----------------------------
-    plt.figure(figsize=(10, 6))
-    plt.plot(K_values, losses_cosine, marker='s', color='orange')
-    plt.xlabel("Number of Clusters (K)", fontsize=16)
-    plt.ylabel("Cosine Clustering Loss", fontsize=16)
-    plt.title("Elbow Plot for KMeans with Cosine Distance", fontsize=18)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("elbow_plot_cosine.png")
-    plt.show()
 
 if __name__ == "__main__":
-    generate_elbow_plot()
+    run_kmeans_and_save_losses()

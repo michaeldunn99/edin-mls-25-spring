@@ -30,10 +30,10 @@ __pycache__/
 .tox/
 coverage.*
 
-# Test results for Task-2
-test_results/*
-!test_results/plot_results.py
-!test_results/README.md
+# Elbow plotting in task 1
+task-1/elbow_plot/
+!task-1/elbow_plot/generate_elbow_plot_data.py
+!task-1/elbow_plot/plot_elbow.py
 
 #Task-1 data
 task-1/data/

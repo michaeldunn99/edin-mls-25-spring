@@ -8,7 +8,7 @@ import torch
 
 
 
-def test_kmeans_time_wrapper(func, N, D, A, K, repeat):
+def test_kmeans_time_wrapper(func, N, D, A, K, repeat, scaling_factor=0.7):
     # Warm up, first run seems to be a lot longer than the subsequent runs
     # result = func(N, D, A, K, number_streams, gpu_batch_number, max_iterations)
     total_time = 0
@@ -21,6 +21,9 @@ def test_kmeans_time_wrapper(func, N, D, A, K, repeat):
         elapsed_time = end - start
         total_time += elapsed_time
         cp.get_default_memory_pool().free_all_blocks()
+        #Synchronise to ensure all GPU computations are finished before measuring time
+        torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
+        cp.cuda.Stream.null.synchronize()  # Ensure all GPU computations are finished before measuring time
     # Synchronise to ensure all GPU computations are finished before measuring end time
     avg_time = (total_time / repeat) * 1000 # Runtime in ms
     print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")

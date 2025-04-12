@@ -18,13 +18,12 @@ import matplotlib.pyplot as plt
 
 BYTES_PER_VALUE = 4
 TOTAL_AVAILABLE_GPU_MEMORY = 20
-SCALING_FACTOR = 1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STREAM_NUM = 2
 RESULTS_DIR = "results_plots"
 
 
-def optimum_knn_batch_size(N, D, num_streams, type):
+def optimum_knn_batch_size(N, D, num_streams, scaling_factor, type):
     if type == "cosine" or type == "l2":
         gpu_calc_memory_multiplier = 2
     elif type == "l1":
@@ -32,7 +31,7 @@ def optimum_knn_batch_size(N, D, num_streams, type):
     elif type == "dot":
         gpu_calc_memory_multiplier = 1
     total_data_size = N * D * 4
-    optimal_data_size_transferrable_to_GPU_per_stream = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier * num_streams)
+    optimal_data_size_transferrable_to_GPU_per_stream = scaling_factor*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier * num_streams)
     # optimal_data_size_transferrable_to_GPU = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
 
 
@@ -48,7 +47,31 @@ def optimum_knn_batch_size(N, D, num_streams, type):
 
     return int(batch_size_vectors), int(total_batches_needed)
 
-def optimum_knn_batch_size_TORCH(N, D, num_streams, type):
+def optimum_knn_batch_size_alt(N, D, num_streams, scaling_factor, type):
+    if type == "cosine" or type == "l2":
+        gpu_calc_memory_multiplier = 2
+    elif type == "l1":
+        gpu_calc_memory_multiplier = 3
+    elif type == "dot":
+        gpu_calc_memory_multiplier = 1
+    total_data_size = N * D * 4
+    optimal_data_size_transferrable_to_GPU_per_stream = scaling_factor*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier * num_streams)
+    # optimal_data_size_transferrable_to_GPU = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
+
+
+    total_batches_needed = (total_data_size + optimal_data_size_transferrable_to_GPU_per_stream -1) // optimal_data_size_transferrable_to_GPU_per_stream
+
+    #If batches needed is not a multiple of the number of streams, we need to round up
+    if total_batches_needed % num_streams != 0:
+        total_batches_needed = (total_batches_needed // num_streams + 1) * num_streams
+    
+    #Calculate the batch size in terms of vectors using the total batches needed
+
+    batch_size_vectors = (N + total_batches_needed -1 ) // total_batches_needed
+
+    return int(batch_size_vectors), int(total_batches_needed)
+
+def optimum_knn_batch_size_TORCH(N, D, num_streams, scaling_factor, type):
     if type == "cosine" or type == "l2":
         gpu_calc_memory_multiplier = 1.5
     elif type == "l1":
@@ -56,7 +79,7 @@ def optimum_knn_batch_size_TORCH(N, D, num_streams, type):
     elif type == "dot":
         gpu_calc_memory_multiplier = 1.5
     total_data_size = N * D * 4
-    optimal_data_size_transferrable_to_GPU_per_stream = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier * float(num_streams))
+    optimal_data_size_transferrable_to_GPU_per_stream = scaling_factor*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier * int(num_streams))
     # optimal_data_size_transferrable_to_GPU = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
 
 
@@ -72,7 +95,7 @@ def optimum_knn_batch_size_TORCH(N, D, num_streams, type):
 
     return int(batch_size_vectors), int(total_batches_needed)
 
-def optimum_knn_batch_size_triton(N, D, type):
+def optimum_knn_batch_size_triton(N, D,scaling_factor, type):
     if type == "cosine" or type == "l2":
         gpu_calc_memory_multiplier = 2
     elif type == "l1":
@@ -80,13 +103,45 @@ def optimum_knn_batch_size_triton(N, D, type):
     elif type == "dot":
         gpu_calc_memory_multiplier = 2
     total_data_size = N * D * 4
-    optimal_data_size_transferrable_to_GPU = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
+    optimal_data_size_transferrable_to_GPU = scaling_factor*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
     # optimal_data_size_transferrable_to_GPU = SCALING_FACTOR*TOTAL_AVAILABLE_GPU_MEMORY * 1024 **3 // (gpu_calc_memory_multiplier)
 
 
     total_kernels_needed = (total_data_size + optimal_data_size_transferrable_to_GPU -1) // optimal_data_size_transferrable_to_GPU
 
     return int(total_kernels_needed)
+
+def optimum_k_means_batch_size(N,D,K, num_streams, type, scaling_factor=0.7):
+    OVERALL_DAMPING_FACTOR = 0.7
+    if type == "cosine" or type == "l2":
+        gpu_calc_memory_multiplier = 3
+    elif type == "l1":
+        gpu_calc_memory_multiplier = 2
+    elif type == "dot":
+        gpu_calc_memory_multiplier = 2
+    #Total available memory on GPU
+    total_available_memory = TOTAL_AVAILABLE_GPU_MEMORY * 1024**3 # 20 GB
+    total_for_k_cluster_centroids = K * D * 4
+    total_for_cluster_sums = K * D * 4
+    total_for_counts = K * 4
+    total_left_for_data = total_available_memory - total_for_k_cluster_centroids - total_for_cluster_sums - total_for_counts
+    total_left_for_data = int(total_left_for_data * OVERALL_DAMPING_FACTOR)
+    # gpu_calc_memory_multipler = 2 #NEED TO WORK THIS OUT
+    data_size_transferrable_to_GPU_per_stream = scaling_factor * total_left_for_data // (gpu_calc_memory_multiplier * num_streams)
+    total_batches_needed = (total_left_for_data + data_size_transferrable_to_GPU_per_stream -1) // data_size_transferrable_to_GPU_per_stream
+
+    #If batches needed is not a multiple of the number of streams, we need to round up
+    if total_batches_needed % num_streams != 0:
+        total_batches_needed = (total_batches_needed // num_streams + 1) * num_streams
+    
+    
+    #Calculate the batch size in terms of vectors using the total batches needed
+
+    batch_size_vectors = (N + total_batches_needed -1 ) // total_batches_needed
+
+    return int(batch_size_vectors), int(total_batches_needed)
+
+
 
 
 def get_gpu_memory():
@@ -1083,7 +1138,128 @@ def our_knn_L2_CUDA(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 # SECTION II B: CUPY KNN FUNCTIONS   
 # ------------------------------------------------------------------------------------------------
-def our_knn_CUPY(N, D, A, X, K, distance_func, inspect_memory=False):
+# def our_knn_CUPY(N, D, A, X, K, distance_func, scaling_factor, inspect_memory=False):
+#     """
+#     Core k-Nearest Neighbors using CuPY with a specified distance function, batching, and CUDA streams.
+#     Assumes A is a NumPy array on CPU and batches are transferred to GPU on-demand.
+
+#     Args:
+#         N (int): Number of vectors
+#         D (int): Dimension of vectors
+#         A (np.ndarray): Collection of vectors [N, D] on CPU
+#         X (np.ndarray or torch.Tensor): Query vector [D]
+#         K (int): Number of nearest neighbors to find
+#         distance_func (str): Distance function to use ("l2", "cosine", "dot", "l1")
+#         device (str): Device to run on ("cuda")
+
+#     Returns:
+#         np.ndarray: Indices of the K nearest vectors [K]
+#     """
+#             # Vectorized distance functions
+#     def l2(A_batch, X):
+#         return  cp.sum((A_batch - X) ** 2, axis=1)
+
+#     def cosine(A_batch, X_normalized):
+#         norms_A = cp.linalg.norm(A_batch, axis=1, keepdims=True) + 1e-8
+#         A_normalized = A_batch / norms_A
+#         similarity = A_normalized @ X_normalized
+#         return 1.0 - similarity
+
+#     def dot(A_batch, X):
+#         return -(A_batch @ X)
+
+#     def l1(A_batch, X):
+#         return cp.sum(cp.abs(A_batch - X), axis=1)
+
+#     # Map distance functions to their vectorized versions
+#     distance_to_vectorized = {
+#         "l2": l2,
+#         "cosine": cosine,
+#         "dot": dot,
+#         "l1": l1,
+#     }
+    
+
+#     gpu_batch_size, gpu_batch_num = optimum_knn_batch_size(N,D, STREAM_NUM,  scaling_factor, distance_func)
+#     # print(f"Batch size: {gpu_batch_size}")
+#     # print(f"Batch num: {gpu_batch_num}")
+    
+#     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+#     # Create multiple CUDA streams
+#     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(STREAM_NUM)]
+#     #load A as a cupy array in full
+#     # Check if A is already on GPU
+#     A_is_gpu = isinstance(A, cp.ndarray)
+#     # Move query vector X to GPU once (shared across all streams)
+#     X_gpu = cp.asarray(X, dtype=cp.float32)
+#     # if inspect_memory:
+#     #     print_mem(f"CUPY {distance_func} - before loading\n")
+
+#     # Preallocate device memory for batches
+#     if not A_is_gpu:
+#         A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(STREAM_NUM)]
+
+#     # Preallocate final distance array
+#     final_distances = cp.empty(N, dtype=cp.float32)
+
+#     # Prepare the distance computation
+#     if distance_func == "cosine":
+#         X_normalized = X_gpu / (cp.linalg.norm(X) + 1e-8)
+#         distance = lambda A_batch: distance_to_vectorized[distance_func](A_batch, X_normalized)
+#     else:
+#         distance = lambda A_batch: distance_to_vectorized[distance_func](A_batch, X_gpu)
+
+#     # Process each batch in its own stream
+#     for i, (start, end) in enumerate(gpu_batches):
+#         stream = streams[i % STREAM_NUM]
+#         A_buf = A_device[i % STREAM_NUM]
+#         batch_size = end - start
+#         #make sure the stream is synchronised before we start
+
+#         with stream:
+#             # Asynchronous copy from CPU to GPU
+#             # if inspect_memory:
+#             #     cp.cuda.Stream.null.synchronize()
+#             #     print_mem(f"CUPY {distance_func} - after loading\n")
+            
+#             # #Copy data into GPU
+#             # A_temp = cp.asarray(A[start:end], dtype=cp.float32)
+#             A_buf[:batch_size].set(A[start:end])
+#             #fill the buffer with the data aynschronously
+#             # cp.copyto(A_buf[:batch_size], A_temp, stream=stream)
+#             final_distances[start:end] = distance(A_buf[:batch_size])
+#             # if inspect_memory:
+#             #     cp.cuda.Stream.null.synchronize()
+#             #     print_mem(f"CUPY {distance_func} - after distance\n")
+                
+
+#     # Wait for all streams to complete
+#     cp.cuda.Stream.null.synchronize()
+
+#     # Top-K selection on GPU
+#     top_k_indices = cp.argpartition(final_distances, K)[:K]
+#     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
+#     return cp.asnumpy(sorted_top_k_indices)
+
+# # Wrapper Functions for Each Distance Metric
+# def our_knn_L2_CUPY(N, D, A, X, K, scaling_factor = 0.7):
+#     """kNN with L2 distance using PyTorch."""
+#     return our_knn_CUPY(N, D, A, X, K, "l2", scaling_factor)
+
+# def our_knn_cosine_CUPY(N, D, A, X, K, scaling_factor=0.7):
+#     """kNN with cosine distance using PyTorch."""
+#     return our_knn_CUPY(N, D, A, X, K, "cosine", scaling_factor)
+
+# def our_knn_dot_CUPY(N, D, A, X, K, scaling_factor=0.7):
+#     """kNN with dot product distance using PyTorch."""
+#     return our_knn_CUPY(N, D, A, X, K, "dot", scaling_factor)
+
+# def our_knn_L1_CUPY(N, D, A, X, K, scaling_factor=0.7):
+#     """kNN with L1 (Manhattan) distance using PyTorch."""
+#     return our_knn_CUPY(N, D, A, X, K, "l1", scaling_factor)
+
+def our_knn_CUPY(N, D, A, X, K, distance_func, scaling_factor, inspect_memory=False):
     """
     Core k-Nearest Neighbors using CuPY with a specified distance function, batching, and CUDA streams.
     Assumes A is a NumPy array on CPU and batches are transferred to GPU on-demand.
@@ -1100,35 +1276,9 @@ def our_knn_CUPY(N, D, A, X, K, distance_func, inspect_memory=False):
     Returns:
         np.ndarray: Indices of the K nearest vectors [K]
     """
-    
-    
-
-    gpu_batch_size, gpu_batch_num = optimum_knn_batch_size(N,D, STREAM_NUM, distance_func)
-    # print(f"Batch size: {gpu_batch_size}")
-    # print(f"Batch num: {gpu_batch_num}")
-    
-    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
-
-    # Create multiple CUDA streams
-    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(STREAM_NUM)]
-    #load A as a cupy array in full
-    # Check if A is already on GPU
-    A_is_gpu = isinstance(A, cp.ndarray)
-    # Move query vector X to GPU once (shared across all streams)
-    X_gpu = cp.asarray(X, dtype=cp.float32)
-    # if inspect_memory:
-    #     print_mem(f"CUPY {distance_func} - before loading\n")
-
-    # Preallocate device memory for batches
-    if not A_is_gpu:
-        A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(STREAM_NUM)]
-
-    # Preallocate final distance array
-    final_distances = cp.empty(N, dtype=cp.float32)
-
-        # Vectorized distance functions
+            # Vectorized distance functions
     def l2(A_batch, X):
-        return  cp.linalg.norm(A_batch - X, axis=1)
+        return  cp.sum((A_batch - X) ** 2, axis=1)
 
     def cosine(A_batch, X_normalized):
         norms_A = cp.linalg.norm(A_batch, axis=1, keepdims=True) + 1e-8
@@ -1149,6 +1299,30 @@ def our_knn_CUPY(N, D, A, X, K, distance_func, inspect_memory=False):
         "dot": dot,
         "l1": l1,
     }
+    
+
+    gpu_batch_size, gpu_batch_num = optimum_knn_batch_size_alt(N,D, STREAM_NUM , scaling_factor, distance_func)
+    # print(f"Batch size: {gpu_batch_size}")
+    # print(f"Batch num: {gpu_batch_num}")
+    
+    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
+
+    # Create multiple CUDA streams
+    # streams = [cp.cuda.Stream(non_blocking=True) for _ in range(STREAM_NUM)]
+    #load A as a cupy array in full
+    # Check if A is already on GPU
+    A_is_gpu = isinstance(A, cp.ndarray)
+    # Move query vector X to GPU once (shared across all streams)
+    X_gpu = cp.asarray(X, dtype=cp.float32)
+    # if inspect_memory:
+    #     print_mem(f"CUPY {distance_func} - before loading\n")
+
+    # Preallocate device memory for batches
+    if not A_is_gpu:
+        A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(STREAM_NUM)]
+
+    # Preallocate final distance array
+    final_distances = cp.empty(N, dtype=cp.float32)
 
     # Prepare the distance computation
     if distance_func == "cosine":
@@ -1157,50 +1331,56 @@ def our_knn_CUPY(N, D, A, X, K, distance_func, inspect_memory=False):
     else:
         distance = lambda A_batch: distance_to_vectorized[distance_func](A_batch, X_gpu)
 
-    # Process each batch in its own stream
+    stream_copy = cp.cuda.Stream(non_blocking=True)
+    stream_compute = cp.cuda.Stream(non_blocking=True)
+
+    # # Allocate two alternating device buffers
+    # A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(2)]
+
     for i, (start, end) in enumerate(gpu_batches):
-        stream = streams[i % STREAM_NUM]
-        A_buf = A_device[i % STREAM_NUM]
+        idx = i % 2
+        A_buf = A_device[idx]
         batch_size = end - start
-        #make sure the stream is synchronised before we start
 
-        with stream:
-            # Asynchronous copy from CPU to GPU
-            # if inspect_memory:
-            #     cp.cuda.Stream.null.synchronize()
-            #     print_mem(f"CUPY {distance_func} - after loading\n")
-            A_buf[:batch_size].set(A[start:end])  
-            A_batch = A_buf[:batch_size]
-            final_distances[start:end] = distance(A_batch)
-            # if inspect_memory:
-            #     cp.cuda.Stream.null.synchronize()
-            #     print_mem(f"CUPY {distance_func} - after distance\n")
-                
+        # Step 1: Load next batch into A_buf via copy stream
+        with stream_copy:
+            # A_temp = cp.asarray(A[start:end], dtype=cp.float32)
+            A_buf[:batch_size].set(A[start:end])
+            copy_event = cp.cuda.Event()
+            stream_copy.record(copy_event)
 
-    # Wait for all streams to complete
-    cp.cuda.Stream.null.synchronize()
+        # Step 2: Wait on compute stream for copy to finish, then compute
+        with stream_compute:
+            stream_compute.wait_event(copy_event)
+            final_distances[start:end] = distance(A_buf[:batch_size])
+
+    # Final sync
+    stream_compute.synchronize()
 
     # Top-K selection on GPU
     top_k_indices = cp.argpartition(final_distances, K)[:K]
     sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
     return cp.asnumpy(sorted_top_k_indices)
 
-# Wrapper Functions for Each Distance Metric
-def our_knn_L2_CUPY(N, D, A, X, K):
+
+    # Wrapper Functions for Each Distance Metric
+def our_knn_L2_CUPY(N, D, A, X, K, scaling_factor = 0.7):
     """kNN with L2 distance using PyTorch."""
-    return our_knn_CUPY(N, D, A, X, K, "l2")
+    return our_knn_CUPY(N, D, A, X, K, "l2", scaling_factor)
 
-def our_knn_cosine_CUPY(N, D, A, X, K):
+def our_knn_cosine_CUPY(N, D, A, X, K, scaling_factor=0.7):
     """kNN with cosine distance using PyTorch."""
-    return our_knn_CUPY(N, D, A, X, K, "cosine")
+    return our_knn_CUPY(N, D, A, X, K, "cosine", scaling_factor)
 
-def our_knn_dot_CUPY(N, D, A, X, K):
+def our_knn_dot_CUPY(N, D, A, X, K, scaling_factor=0.7):
     """kNN with dot product distance using PyTorch."""
-    return our_knn_CUPY(N, D, A, X, K, "dot")
+    return our_knn_CUPY(N, D, A, X, K, "dot", scaling_factor)
 
-def our_knn_L1_CUPY(N, D, A, X, K):
+def our_knn_L1_CUPY(N, D, A, X, K, scaling_factor=0.7):
     """kNN with L1 (Manhattan) distance using PyTorch."""
-    return our_knn_CUPY(N, D, A, X, K, "l1")
+    return our_knn_CUPY(N, D, A, X, K, "l1", scaling_factor)
+
+
 
 # ------------------------------------------------------------------------------------------------
 # SECTION II C: Triton KNN FUNCTIONS 
@@ -1273,7 +1453,7 @@ def our_knn_l2_triton_kernel(A_ptr,
 
 #L2 Triton Host Function: This function calls the Triton kernel to compute the L2 distance between a vector X and all rows of a matrix A.
 #The function processes the matrix A in batches to avoid memory overload.
-def our_knn_l2_triton(N, D, A, X, K):
+def our_knn_l2_triton(N, D, A, X, K, scaling_factor=0.7):
     """
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
@@ -1282,7 +1462,7 @@ def our_knn_l2_triton(N, D, A, X, K):
     BLOCK_SIZE = 512
 
     # number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
-    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, "l2")
+    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, scaling_factor, "l2")
 
     num_rows_per_kernel = triton.cdiv(N, number_kernels_to_launch)
 
@@ -1416,7 +1596,7 @@ def cosine_distance_triton_kernel_2d(A_ptr,
 
 
 #Host function to calculate k-nearest neighbors using cosine distance, calls the Triton kernel
-def our_knn_cosine_triton(N, D, A, X, K):
+def our_knn_cosine_triton(N, D, A, X, K,scaling_factor=0.7):
     """
     Args:
         A: numpy array of shape (N, D)
@@ -1429,7 +1609,7 @@ def our_knn_cosine_triton(N, D, A, X, K):
     #Block size chosen because it is the maximum size of a warp
     BLOCK_SIZE = 512
 
-    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, "cosine")
+    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, scaling_factor, "cosine")
 
     num_rows_per_kernel = triton.cdiv(N, number_kernels_to_launch)
 
@@ -1541,7 +1721,7 @@ def our_knn_dot_triton_kernel(A_ptr,
 
 #Dot product Triton Host Function: This function calls the Triton kernel to compute the L2 distance between a vector X and all rows of a matrix A.
 #The function processes the matrix A in batches to avoid memory overload.
-def our_knn_dot_triton(N, D, A, X, K):
+def our_knn_dot_triton(N, D, A, X, K, scaling_factor=0.7):
     """
     Args:
         A: numpy array of shape (N, D)
@@ -1554,7 +1734,7 @@ def our_knn_dot_triton(N, D, A, X, K):
     BLOCK_SIZE = 512
 
     # number_kernels_to_launch = triton.cdiv(N, num_rows_per_kernel)
-    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, "dot")
+    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, scaling_factor, "dot")
 
     num_rows_per_kernel = triton.cdiv(N, number_kernels_to_launch)
     
@@ -1678,7 +1858,7 @@ def our_knn_l1_triton_kernel(A_ptr,
 
 #L2 Triton Host Function: This function calls the Triton kernel to compute the L2 distance between a vector X and all rows of a matrix A.
 #The function processes the matrix A in batches to avoid memory overload.
-def our_knn_l1_triton(N, D, A, X, K):
+def our_knn_l1_triton(N, D, A, X, K, scaling_factor=0.7):
     """
     Args:
         A is a np array - designed to be as large as the CPU can manage realistically
@@ -1686,7 +1866,7 @@ def our_knn_l1_triton(N, D, A, X, K):
     #Block size is the number of elements in the row sized chosen here
     BLOCK_SIZE = 512
 
-    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, "l1")
+    number_kernels_to_launch = optimum_knn_batch_size_triton(N,D, scaling_factor,"l1")
 
     num_rows_per_kernel = triton.cdiv(N, number_kernels_to_launch)
     
@@ -1831,7 +2011,7 @@ def our_knn_TORCH_no_batching(N, D, A, X, K, distance_func, device="cuda"):
     # Convert to NumPy and return
     return top_k_indices.cpu().numpy()
 
-def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
+def our_knn_TORCH(N, D, A, X, K, distance_func, scaling_factor, device="cuda"):
     """
     Core k-Nearest Neighbors using PyTorch with a specified distance function, batching, and CUDA streams.
     Assumes A is a NumPy array on CPU and batches are transferred to GPU on-demand.
@@ -1852,7 +2032,7 @@ def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
         raise ValueError("This implementation requires a CUDA device for stream optimization.")
     stream_num = STREAM_NUM
     # Set up batching
-    gpu_batch_size, gpu_batch_num = optimum_knn_batch_size_TORCH(N, D, stream_num, distance_func)
+    gpu_batch_size, gpu_batch_num = optimum_knn_batch_size_TORCH(N, D, stream_num, scaling_factor, distance_func)
     # gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_expected = gpu_batch_size *stream_num*D * 4 / (1024**2)
     # print(f"Expected max size of data on the GPU is  = {gpu_expected} MB")
@@ -1929,25 +2109,25 @@ def our_knn_TORCH(N, D, A, X, K, distance_func, device="cuda"):
 
 
 # Wrapper Functions for Each Distance Metric
-def our_knn_L2_TORCH(N, D, A, X, K):
+def our_knn_L2_TORCH(N, D, A, X, K, scaling_factor=0.7):
     """kNN with L2 distance using PyTorch."""
-    return our_knn_TORCH(N, D, A, X, K, "l2")
+    return our_knn_TORCH(N, D, A, X, K, "l2", scaling_factor)
 
-def our_knn_cosine_TORCH(N, D, A, X, K):
+def our_knn_cosine_TORCH(N, D, A, X, K, scaling_factor=0.7):
     """kNN with cosine distance using PyTorch."""
-    return our_knn_TORCH(N, D, A, X, K, "cosine")
+    return our_knn_TORCH(N, D, A, X, K, "cosine", scaling_factor)
 
-def our_knn_dot_TORCH(N, D, A, X, K):
+def our_knn_dot_TORCH(N, D, A, X, K, scaling_factor=0.7):
     """kNN with dot product distance using PyTorch."""
-    return our_knn_TORCH(N, D, A, X, K, "dot")
+    return our_knn_TORCH(N, D, A, X, K, "dot", scaling_factor)
 
-def our_knn_L1_TORCH(N, D, A, X, K):
+def our_knn_L1_TORCH(N, D, A, X, K, scaling_factor=0.7):
     """kNN with L1 (Manhattan) distance using PyTorch."""
-    return our_knn_TORCH(N, D, A, X, K, "l1")
+    return our_knn_TORCH(N, D, A, X, K, "l1", scaling_factor)
 
-def our_knn_L2_TORCH_no_batching(N, D, A, X, K):
+def our_knn_L2_TORCH_no_batching(N, D, A, X, K, scaling_factor=0.7):
     """kNN with L2 distance using PyTorch without batching."""
-    return our_knn_TORCH_no_batching(N, D, A, X, K, "l2")
+    return our_knn_TORCH_no_batching(N, D, A, X, K, "l2", scaling_factor)
 
 # ------------------------------------------------------------------------------------------------
 # SECTION II E: CPU KNN FUNCTIONS 
@@ -1955,22 +2135,22 @@ def our_knn_L2_TORCH_no_batching(N, D, A, X, K):
 
 import numpy as np
 
-def our_knn_l2_cpu(N, D, A, X, K):
+def our_knn_l2_cpu(N, D, A, X, K,scaling_factor=1):
     distances = np.linalg.norm(A - X, axis=1)  # Euclidean distance
     return np.argsort(distances)[:K]           # K smallest distances
 
-def our_knn_l1_cpu(N, D, A, X, K):
+def our_knn_l1_cpu(N, D, A, X, K,scaling_factor=1):
     distances = np.sum(np.abs(A - X), axis=1)  # L1 (Manhattan) distance
     return np.argsort(distances)[:K]
 
-def our_knn_cosine_cpu(N, D, A, X, K):
+def our_knn_cosine_cpu(N, D, A, X, K,scaling_factor=1):
     A_norm = np.linalg.norm(A, axis=1)
     X_norm = np.linalg.norm(X)
     cosine_sim = np.dot(A, X) / (A_norm * X_norm + 1e-8)  # cosine similarity
     cosine_dist = 1 - cosine_sim                          # convert to distance
     return np.argsort(cosine_dist)[:K]
 
-def our_knn_dot_cpu(N, D, A, X, K):
+def our_knn_dot_cpu(N, D, A, X, K,scaling_factor=1):
     dot_products = np.dot(A, X)
     return np.argsort(dot_products)[-K:][::-1]  # top-K largest dot products
     
@@ -2089,9 +2269,13 @@ def our_kmeans_L2_CUPY(N, D, A, K):
     # Also return the centroids on the CPU
     return cluster_assignments, centroids_gpu
 
-def our_kmeans_L2_updated(N, D, A, K, num_streams=4, gpu_batch_num=20, max_iterations=10):
+def our_kmeans_L2_updated(N, D, A, K, scale_factor=1, num_streams=2, max_iterations=10, profile_mem=False):
     tol = 1e-4
-    gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
+    gpu_batch_size, gpu_batch_num = optimum_k_means_batch_size(N, D, K, num_streams, "l2", 1)
+    print(f"gpu_batch_size is {gpu_batch_size}")
+    print(f"gpu_batch_num is {gpu_batch_num}")
+    print(f"Expected memory jus from data is {gpu_batch_size * num_streams* D * 4 / (1024**2)} MB")
+    # gpu_batch_size = (N + gpu_batch_num - 1) // gpu_batch_num
     gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, N)) for i in range(gpu_batch_num)]
 
     cluster_assignments = cp.empty(N, dtype=np.int32)
@@ -2099,56 +2283,92 @@ def our_kmeans_L2_updated(N, D, A, K, num_streams=4, gpu_batch_num=20, max_itera
     # Initialise GPU centroids
     np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
+
+    if profile_mem:
+        print_mem("Before copy to GPU")
+        #Synchronize the GPU
+        cp.cuda.Stream.null.synchronize()
+
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
-    # print(f"Centroids gpu data type is {centroids_gpu.dtype}")
-    # print(f"Centroids gpu first 50 elements are {centroids_gpu[:50]}")
 
     # Preallocate buffers and streams
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
     A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(num_streams)]
     assignments_gpu = [cp.empty(gpu_batch_size, dtype=cp.int32) for _ in range(num_streams)]
 
+    if profile_mem:
+        print_mem("After copy to GPU before computation")
+        #Synchronize the GPU
+        cp.cuda.Stream.null.synchronize()
+
 
     for j in range(max_iterations):
         print(f"Max iters is {j}")
+
         cluster_sums_stream = [cp.zeros((K, D), dtype=cp.float32) for _ in range(num_streams)]
         counts_stream = [cp.zeros(K, dtype=cp.int32) for _ in range(num_streams)]
+        if profile_mem:
+            print_mem("After cluster sums stream and counts stream")
 
 
         #Assign clusters in parallel across streams and write to global buffers (one buffer per stream)
         #Then compute the cluster sums and counts by summing the global buffers at the end
         for i, (start, end) in enumerate(gpu_batches):
+            print(f"Start is {start}, end is {end}")
             stream = streams[i%num_streams]
             A_buf = A_device[i%num_streams]
             assignments_buf = assignments_gpu[i % num_streams]
             batch_size = end - start
             with stream:
-                # Async copy
+                # Async copy - dont believe this is async (but we do want it to be large as possible I think)
                 A_buf[:batch_size].set(A[start:end])
 
                 A_batch = A_buf[:batch_size]
 
                 # Compute distances
                 A_norm = cp.sum(A_batch ** 2, axis=1, keepdims=True)
+
+                if profile_mem:
+                    print_mem("After distance computation 1")
+                    cp.cuda.Stream.null.synchronize()
+
                 C_norm = cp.sum(centroids_gpu ** 2, axis=1, keepdims=True).T
+
+                if profile_mem:
+                    print_mem("After distance computation 2")
+                    cp.cuda.Stream.null.synchronize()
+                
                 dot = A_batch @ centroids_gpu.T
                 distances = A_norm + C_norm - 2 * dot
-                # Optional: report tie stats
-                # num_tied = cp.sum(cp.sum(distances == distances.min(axis=1, keepdims=True), axis=1) > 1)
-                # print(f"{num_tied.item()} vectors have ties in this batch")
+
+                if profile_mem:
+                    print_mem("After distance computation 3")
+                    cp.cuda.Stream.null.synchronize()
 
                 # Assign to nearest centroid
                 assignments = cp.argmin(distances, axis=1)
-                #print if there are multiple distances that are the minimum
-                # if cp.any(cp.sum(distances == distances.min(axis=1, keepdims=True), axis=1) > 1):
-                #     print("Multiple distances are the same for some vectors")
+
                 assignments_buf[:batch_size] = assignments
                 cluster_assignments[start:end] = assignments_buf[:batch_size]
 
                 # Compute per-cluster sum and counts using vectorized one-hot trick
                 one_hot = cp.eye(K, dtype=A_batch.dtype)[assignments]
+
+                if profile_mem:
+                    print_mem("After distance computation 4")
+                    cp.cuda.Stream.null.synchronize()
+
                 batch_cluster_sum = one_hot.T @ A_batch  # (K, D)
+                
+                if profile_mem:
+                    print_mem("After distance computation 5")
+                    cp.cuda.Stream.null.synchronize()
+
                 batch_counts = cp.bincount(assignments, minlength=K)  # (K,)
+
+                if profile_mem:
+                    print_mem("After distance computation 6")
+                    cp.cuda.Stream.null.synchronize()
 
                 # Accumulate into global buffers
                 cluster_sums_stream[i % num_streams] += batch_cluster_sum
@@ -2176,6 +2396,11 @@ def our_kmeans_L2_updated(N, D, A, K, num_streams=4, gpu_batch_num=20, max_itera
 
         # Check for convergence
         shift = cp.linalg.norm(updated_centroids - centroids_gpu)
+
+        if profile_mem:
+            print_mem("After distance computation 7")
+            cp.cuda.Stream.null.synchronize()
+
         print(f"Shift is {shift}")
         print(f"Dead centroids: {cp.sum(dead_mask).item()}")
         if shift < tol:
@@ -2196,8 +2421,6 @@ def our_kmeans_L2_updated_no_batching(N, D, A, K, num_streams=4, gpu_batch_num=2
     np.random.seed(42)
     indices = np.random.choice(N, K, replace=False)
     centroids_gpu = cp.asarray(A[indices], dtype=cp.float32)
-    # print(f"Centroids gpu data type is {centroids_gpu.dtype}")
-    # print(f"Centroids gpu first 50 elements are {centroids_gpu[:50]}")
 
     # Preallocate buffers and streams
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams)]
@@ -2583,7 +2806,7 @@ def test_distance_wrapper(func, X, Y, repeat=10):
     return func.__name__, result, avg_time
 
 
-def test_knn_wrapper(func, N, D, A, X, K, repeat):
+def test_knn_wrapper(func, N, D, A, X, K, repeat, scaling_factor=0.7):
     # Warm up, first run seems to be a lot longer than the subsequent runs
     result = func(N, D, A, X, K)
     torch.cuda.synchronize()
@@ -2591,14 +2814,12 @@ def test_knn_wrapper(func, N, D, A, X, K, repeat):
     torch.cuda.synchronize()
     cp.get_default_memory_pool().free_all_blocks()
     torch.cuda.synchronize()
-    print("Waiting for 2 seconds to ensure all GPU computations are finished and cache is cleared.")
-    time.sleep(2)
     print(f"Running {func.__name__} with {N} vectors of dimension {D} and K={K} for {repeat} times.")
     total_time = 0
     for _ in range(repeat):
         # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         start = time.time()
-        result = func(N, D, A, X, K)
+        result = func(N, D, A, X, K, scaling_factor)
         torch.cuda.synchronize()
         end = time.time()
         elapsed = end - start
@@ -2614,7 +2835,7 @@ def test_knn_wrapper(func, N, D, A, X, K, repeat):
     print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
     return func.__name__, result, avg_time
 
-def test_knn_wrapper_multi_query(func, N, D, A, X_matrix, K, repeat):
+def test_knn_wrapper_multi_query(func, N, D, A, X_matrix, K, repeat,scaling_factor=0.7):
     # Warm up, first run seems to be a lot longer than the subsequent runs
     result = func(N, D, A, X_matrix[0], K)
     torch.cuda.synchronize()
@@ -2630,7 +2851,7 @@ def test_knn_wrapper_multi_query(func, N, D, A, X_matrix, K, repeat):
         X = X_matrix[i]
         # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         start = time.time()
-        result = func(N, D, A, X, K)
+        result = func(N, D, A, X, K,scaling_factor)
         torch.cuda.synchronize()
         end = time.time()
         elapsed = end - start
@@ -2649,17 +2870,21 @@ def test_knn_wrapper_multi_query(func, N, D, A, X_matrix, K, repeat):
 
 def test_kmeans_wrapper(func, N, D, A, K, repeat):
     # Warm up, first run seems to be a lot longer than the subsequent runs
-    # result = func(N, D, A, K, number_streams, gpu_batch_number, max_iterations)
+    result = func(N, D, A, K)
+    cp.cuda.Stream.null.synchronize()
+    torch.cuda.synchronize
     total_time = 0
     for _ in range(repeat):
         start = time.time()
         # This will now find the result from the first CPU batch. Need to run func a number of times to complete all the CPU batches
         result = func(N, D, A, K)
         cp.cuda.Stream.null.synchronize()
+        torch.cuda.synchronize()
         end = time.time()
         elapsed_time = end - start
         total_time += elapsed_time
         cp.get_default_memory_pool().free_all_blocks()
+        cp.cuda.Stream.null.synchronize()
     # Synchronise to ensure all GPU computations are finished before measuring end time
     avg_time = (total_time / repeat) * 1000 # Runtime in ms
     print(f"{func.__name__} - Result: {result}, Number of Vectors: {N}, Dimension: {D}, K: {K}, \nTime: {avg_time:.6f} milliseconds.\n")
@@ -2767,29 +2992,30 @@ def plot_results(results, save_dir=None, file_name=None, show=True):
     Plot benchmarking results as grouped bar charts per distance metric.
 
     Parameters:
-    - results: List of dicts with keys: Function, Metric, Backend, Vector Count, Dim, Time (s)
+    - results: List of dicts with keys: Function, Metric, Backend, Vector Count, Dim, Time (ms)
     - save_dir: Optional directory to save the plot
     - file_name: Optional file name (e.g., 'plot.pdf'); used only if save_dir is provided
     - show: Whether to display the plot (default: True)
     """
 
-    # Prepare the data
     df = pd.DataFrame(results)
 
-    # Convert time to milliseconds
+    if df.empty:
+        print("⚠️ No results to plot.")
+        return
 
-    # Format vector count for x-axis
+    # Format axis labels
     df['Vector Count Label'] = df['Vector Count'].apply(lambda x: f"{x//1000}K")
     df['Metric'] = pd.Categorical(df['Metric'], ['L1', 'L2', 'Cosine', 'Dot'])
     df['Vector Count Label'] = pd.Categorical(
         df['Vector Count Label'],
         sorted(df['Vector Count Label'].unique(), key=lambda x: int(x.replace('K', '')))
     )
+    df['Backend'] = df['Backend'].astype(str)  # Ensure consistency
 
-    # Set theme
     sns.set_theme(style='whitegrid', font_scale=1.4)
 
-    # Create the plot
+    # Create bar plot with automatic legend
     g = sns.catplot(
         data=df,
         kind='bar',
@@ -2801,47 +3027,43 @@ def plot_results(results, save_dir=None, file_name=None, show=True):
         height=4,
         aspect=1.4,
         palette='Set2',
-        legend_out=True
+        legend=True
     )
 
-    # Titles and axis labels
     g.set_titles("{col_name} Distance")
     g.set_axis_labels("Vector Count", "Execution Time (ms)")
 
-    # Legend adjustments (smaller fonts)
-    legend = g._legend
-    legend.set_title("Backend", prop={'size': 12})
-    for text in legend.texts:
-        text.set_fontsize(11)
-
-    # Add bar labels above bars with small offset
+    # Annotate each bar with value (1 decimal place)
     for ax in g.axes.flat:
         for p in ax.patches:
             height = p.get_height()
             if height > 0:
                 ax.annotate(
-                    f'{height:.1f}',
+                    f'{int(height+0.5)}',
                     (p.get_x() + p.get_width() / 2., height + 0.02 * height),
                     ha='center', va='bottom',
-                    fontsize=9,
+                    fontsize=7,
                     color='black'
                 )
 
-    # Adjust layout for spacing
-    plt.subplots_adjust(top=0.9, bottom=0.1, right=0.85)
-    plt.tight_layout()
+    # Layout adjustments
+    g.tight_layout()
 
     # Save if requested
     if save_dir and file_name:
         os.makedirs(save_dir, exist_ok=True)
         full_path = os.path.join(save_dir, file_name)
-        g.savefig(full_path, bbox_inches='tight')
-        print(f"Plot saved to {full_path}")
+        g.savefig(full_path, bbox_inches='tight', pad_inches=0.3)
+        print(f"✅ Plot saved to {full_path}")
 
     if show:
         plt.show()
     else:
         plt.close()
+def plot_graph():
+    #load pandas dataframe from csv
+    df = pd.read_csv('results_plots/with_cpu_results.csv')
+    plot_results(df, save_dir='results_plots', file_name='with_cpu_results.pdf', show=True)
 
 
 def test_knn():
@@ -2850,7 +3072,47 @@ def test_knn():
     A = np.random.randn(N, D).astype(np.float32)
     X = np.random.randn(D).astype(np.float32)
     K = 10
+    repeat = 5
 
+    knn_functions = [           
+        # our_knn_L2_TORCH_no_batching,
+        # our_knn_L2_CUPY,
+        # our_knn_L2_CUPY_alt,
+        # # our_knn_cosine_CUPY,
+        # # our_knn_dot_CUPY,
+        # # our_knn_L1_CUPY,
+        # our_knn_L2_TORCH,
+        # our_knn_L1_TORCH,
+        # our_knn_cosine_TORCH,
+        # our_knn_dot_TORCH,
+        # our_knn_L2_CUDA,
+        # our_knn_l2_triton,
+        # our_knn_cosine_triton,
+        # our_knn_dot_triton,
+        # our_knn_l1_triton,
+        our_knn_dot_cpu
+    ]
+    if knn_functions:
+        for func in knn_functions:
+            name, result, avg_time = test_knn_wrapper(func, N, D, A, X, K, repeat)
+            print(f"Function: {name}, Result: {result}, Time: {avg_time:.6f} milliseconds.")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            print_mem(f"After running function {func.__name__} with {N} vectors of dimension {D} and K={K}")
+            #empty Cupy memory pool
+            cp.get_default_memory_pool().free_all_blocks()
+            torch.cuda.synchronize()
+
+
+def tune_batch_size_knn():
+    N = 4_000_000
+    D = 1024
+    A = np.random.randn(N, D).astype(np.float32)
+    X = np.random.randn(D).astype(np.float32)
+    K = 10
+    repeat = 3
+
+    scaling_factors = [0.1, 0.15, 0.2, 0.3]
     knn_functions = [           
         # our_knn_L2_TORCH_no_batching,
         # our_knn_L2_CUPY,
@@ -2865,18 +3127,30 @@ def test_knn():
         our_knn_l2_triton,
         our_knn_cosine_triton,
         our_knn_dot_triton,
-        our_knn_l1_triton
+        our_knn_l1_triton,
+        # our_knn_L2_CUPY_alt,
+        # our_knn_L1_CUPY_alt,
+        # our_knn_cosine_CUPY_alt,
+        # our_knn_dot_CUPY_alt,
+
     ]
     if knn_functions:
         for func in knn_functions:
-            name, result, avg_time = test_knn_wrapper(func, N, D, A, X, K, repeat=1)
-            print(f"Function: {name}, Result: {result}, Time: {avg_time:.6f} milliseconds.")
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            print_mem(f"After running function {func.__name__} with {N} vectors of dimension {D} and K={K}")
-            #empty Cupy memory pool
-            cp.get_default_memory_pool().free_all_blocks()
-            torch.cuda.synchronize()
+            optimum_scale_factor = 0.1
+            best_time = np.inf
+            for scaling_factor in scaling_factors:
+                name, result, avg_time = test_knn_wrapper(func, N, D, A, X, K, repeat,scaling_factor)
+                print(f"Function: {name}, Result: {result}, Time: {avg_time:.6f} milliseconds.")
+                if avg_time < best_time:
+                    best_time = avg_time
+                    optimum_scale_factor = scaling_factor
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print_mem(f"After running function {func.__name__} with {N} vectors of dimension {D} and K={K}")
+                #empty Cupy memory pool
+                cp.get_default_memory_pool().free_all_blocks()
+                torch.cuda.synchronize()
+            print(f"Optimum scale factor for {func.__name__} is {optimum_scale_factor} with time {best_time:.6f} milliseconds.")
 
 
 def compare_knn_test():
@@ -2890,25 +3164,26 @@ def compare_knn_test():
     knn_functions = [   
                         
                         # our_knn_L2_TORCH_no_batching,
-                        our_knn_L2_CUPY,
-                        our_knn_cosine_CUPY,
-                        our_knn_dot_CUPY,
-                        our_knn_L1_CUPY,
-                        our_knn_L2_TORCH,
-                        our_knn_L1_TORCH,
-                        our_knn_cosine_TORCH,
-                        our_knn_dot_TORCH,
+                        (our_knn_L2_CUPY,0.1),
+                        (our_knn_cosine_CUPY, 0.15),
+                        (our_knn_dot_CUPY, 0.15),
+                        (our_knn_L1_CUPY,0.1),
+                        (our_knn_L2_TORCH,0.2),
+                        (our_knn_L1_TORCH,0.1),
+                        (our_knn_cosine_TORCH, 0.1),
+                        (our_knn_dot_TORCH, 0.2),
                         # our_knn_L2_CUDA,
-                        our_knn_l2_triton,
-                        our_knn_cosine_triton,
-                        our_knn_dot_triton,
-                        our_knn_l1_triton,
-                        # our_knn_l2_cpu,
-                        # our_knn_cosine_cpu,
-                        # our_knn_dot_cpu,
-                        # our_knn_l1_cpu,
+                        (our_knn_l2_triton, 0.1),
+                        (our_knn_cosine_triton, 0.15),
+                        (our_knn_dot_triton,0.15),
+                        (our_knn_l1_triton,0.1),
+                        (our_knn_l2_cpu,1),
+                        (our_knn_cosine_cpu,1),
+                        (our_knn_dot_cpu,1),
+                        (our_knn_l1_cpu,1),
                     ]
     data_configs = [(4000, 1024), (40_000, 1024), (400_000, 1024), (4_000_000, 1024)]
+    # data_configs = [(4000, 1024), (40_000, 1024)]
     # data_configs = [(4000,1024), (400000,1024), (4_000_000,1024), (15_000_000, 1024)]
 
     # function_times_df = pd.DataFrame(index=knn_functions, columns=data_configs)
@@ -2929,8 +3204,8 @@ def compare_knn_test():
             A = np.random.randn(N, D).astype(np.float32)
             X = np.random.randn(D).astype(np.float32) 
         
-            for func in knn_functions:
-                name, result, avg_time = test_knn_wrapper(func, N, D, A, X, K, repeat)
+            for func, scaling_factor in knn_functions:
+                name, result, avg_time = test_knn_wrapper(func, N, D, A, X, K, repeat,scaling_factor)
                 # test_knn_wrapper_multi_query(func, N, D, A, X_matrix, K, repeat)
                 torch.cuda.synchronize()
                 # function_times_df.loc[name, (N, D)] = time
@@ -2948,19 +3223,41 @@ def compare_knn_test():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 print_mem(f"After running function {func.__name__} with {N} vectors of dimension {D} and K={K}")
-                print("Waiting for 5 seconds to ensure all GPU computations are finished and cache is cleared.")
                 #empty Cupy memory pool
                 cp.get_default_memory_pool().free_all_blocks()
                 torch.cuda.synchronize()
         #write the results to a csv file
         results_df = pd.DataFrame(results)
-        results_df.to_csv(os.path.join(RESULTS_DIR, 'results.csv'), index=False)
+        df = pd.DataFrame(results)
+        print(df[['Backend', 'Metric', 'Vector Count']].drop_duplicates())
+        results_df.to_csv(os.path.join(RESULTS_DIR, 'with_cpu_knn_results.csv'), index=False)
         #Create plots for the function times
-        plot_results(results, save_dir=RESULTS_DIR, file_name='knn_plot.pdf', show=True)
+        plot_results(results, save_dir=RESULTS_DIR, file_name='with_cpu_knn_plot.pdf', show=True)
 
+def test_k_means():
+    funcs = [
+        our_kmeans_L2_updated,
+        # our_kmeans_L2
+    ]
+    N = 6000000
+    D = 512
+    A = np.random.rand(N, D).astype(np.float32)
+    K = 10
+    repeat = 1
+    times = []
+    for func in funcs:
+        print(f"Testing function: {func.__name__}")
+        result = test_kmeans_wrapper(func, N, D, A, K, repeat=repeat)
+        torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
+        times.append(result)
+    for i, time in enumerate(times):
+        print(f"Function {funcs[i].__name__} took {time:.6f} milliseconds")
 if __name__ == "__main__":
-    compare_knn_test()
+    # compare_knn_test()
+    # plot_graph()
+    test_k_means()
     # test_knn()
+    # tune_batch_size_knn()
 
     
     # if kmeans_functions:

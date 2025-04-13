@@ -73,10 +73,6 @@ edin-mls-25-spring/
   - `task-2/serving_rag_v1.py`: Queued-Batched serving system.
   - `task-2/test_end_to_end.py`: Benchmarking script for Task 2.
 
-## Setting Up the Environment
-
-[To be filled in later]
-
 ## Optimizations
 
 ### Task 1

@@ -15,7 +15,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import statistics
-
+from datetime import datetime
+from cuml.cluster import KMeans
 
 
 BYTES_PER_VALUE = 4
@@ -254,87 +255,116 @@ def print_mem(msg=''):
 # SECTION I A: CUPY DISTANCE FUNCTIONS   
 # ------------------------------------------------------------------------------------------------
 
-# CuPy L2 Distance function
-def distance_l2_CUPY(X, Y):
-    """
-    Computes the squared Euclidean (L2 squared) distance between two vectors.
-
-    Parameters:
-    X (cupy.ndarray): First input vector.
-    Y (cupy.ndarray): Second input vector.
-
-    Returns:
-    cupy.ndarray: Squared Euclidean distance between X and Y.
-    """
-    # Trasform to cupy array
+def distance_l2_CUPY(X, Y, multiple=False, profile=False):
+    if profile:
+        evt_total_start = cp.cuda.Event(); evt_total_end = cp.cuda.Event()
+        evt_mem_start = cp.cuda.Event(); evt_mem_end = cp.cuda.Event()
+        evt_comp_start = cp.cuda.Event(); evt_comp_end = cp.cuda.Event()
+        evt_total_start.record()
+        evt_mem_start.record()
     X = cp.asarray(X)
     Y = cp.asarray(Y)
-    return cp.linalg.norm(X - Y)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = cp.linalg.norm(X - Y, axis=1)
+    else:
+        result = cp.linalg.norm(X - Y)
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        evt_total_end.synchronize()
+        total_time = cp.cuda.get_elapsed_time(evt_total_start, evt_total_end)
+        mem_time = cp.cuda.get_elapsed_time(evt_mem_start, evt_mem_end)
+        comp_time = cp.cuda.get_elapsed_time(evt_comp_start, evt_comp_end)
+        print(f"[distance_l2_CUPY] Total: {total_time:.3f} ms | Transfer: {mem_time:.3f} ms | Compute: {comp_time:.3f} ms")
+    return result
 
-# CuPy Cosine Distance function
-def distance_cosine_CUPY(X, Y):
-    """
-    Compute the cosine distance between two vectors.
-    
-    Parameters:
-    X (cupy.ndarray): First input array (vector) of shape (d,).
-    Y (cupy.ndarray): Second input array (vector) of shape (d,).
-
-    Returns:
-    cupy.ndarray: The cosine distance between the two input vectors.
-    """
-    # Trasform to cupy array
+def distance_cosine_CUPY(X, Y, multiple=False, profile=False):
+    if profile:
+        evt_total_start = cp.cuda.Event(); evt_total_end = cp.cuda.Event()
+        evt_mem_start = cp.cuda.Event(); evt_mem_end = cp.cuda.Event()
+        evt_comp_start = cp.cuda.Event(); evt_comp_end = cp.cuda.Event()
+        evt_total_start.record()
+        evt_mem_start.record()
     X = cp.asarray(X)
     Y = cp.asarray(Y)
-    
-    # Compute dot product
-    dot_product = cp.sum(X*Y)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        dot_product = cp.sum(X * Y, axis=1)
+        norm_x = cp.linalg.norm(X, axis=1)
+        norm_y = cp.linalg.norm(Y, axis=1)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    else:
+        dot_product = cp.sum(X * Y)
+        norm_x = cp.linalg.norm(X)
+        norm_y = cp.linalg.norm(Y)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        evt_total_end.synchronize()
+        total_time = cp.cuda.get_elapsed_time(evt_total_start, evt_total_end)
+        mem_time = cp.cuda.get_elapsed_time(evt_mem_start, evt_mem_end)
+        comp_time = cp.cuda.get_elapsed_time(evt_comp_start, evt_comp_end)
+        print(f"[distance_cosine_CUPY] Total: {total_time:.3f} ms | Transfer: {mem_time:.3f} ms | Compute: {comp_time:.3f} ms")
+    return result
 
-    # Compute norms
-    norm_x = cp.linalg.norm(X)
-    norm_y = cp.linalg.norm(Y)
-
-    return 1.0 - (dot_product) / (norm_x * norm_y)
-
-
-# CuPy Dot Product function
-def distance_dot_CUPY(X, Y):
-    """
-    Computes the dot product distance between two vectors.
-
-    Parameters:
-    X (cupy.ndarray): First input vector.
-    Y (cupy.ndarray): Second input vector.
-
-    Returns:
-    cupy.ndarray: The dot product distance.
-    """
-
-    #Trasform to cupy array
+def distance_dot_CUPY(X, Y, multiple=False, profile=False):
+    if profile:
+        evt_total_start = cp.cuda.Event(); evt_total_end = cp.cuda.Event()
+        evt_mem_start = cp.cuda.Event(); evt_mem_end = cp.cuda.Event()
+        evt_comp_start = cp.cuda.Event(); evt_comp_end = cp.cuda.Event()
+        evt_total_start.record()
+        evt_mem_start.record()
     X = cp.asarray(X)
     Y = cp.asarray(Y)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = -cp.sum(X * Y, axis=1)
+    else:
+        result = -cp.sum(X * Y)
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        evt_total_end.synchronize()
+        total_time = cp.cuda.get_elapsed_time(evt_total_start, evt_total_end)
+        mem_time = cp.cuda.get_elapsed_time(evt_mem_start, evt_mem_end)
+        comp_time = cp.cuda.get_elapsed_time(evt_comp_start, evt_comp_end)
+        print(f"[distance_dot_CUPY] Total: {total_time:.3f} ms | Transfer: {mem_time:.3f} ms | Compute: {comp_time:.3f} ms")
+    return result
 
-    return cp.sum(X*Y)
-
-#CuPy Manhattan (L1) Distance function
-def distance_manhattan_CUPY(X, Y):
-
-    """
-    Computes the Manhattan (L1) distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray): First input vector.
-    Y (numpy.ndarray): Second input vector.
-
-    Returns:
-    cupy.ndarray: The Manhattan distance.
-    """
-
-    #Trasform to cupy array
+def distance_manhattan_CUPY(X, Y, multiple=False, profile=False):
+    if profile:
+        evt_total_start = cp.cuda.Event(); evt_total_end = cp.cuda.Event()
+        evt_mem_start = cp.cuda.Event(); evt_mem_end = cp.cuda.Event()
+        evt_comp_start = cp.cuda.Event(); evt_comp_end = cp.cuda.Event()
+        evt_total_start.record()
+        evt_mem_start.record()
     X = cp.asarray(X)
     Y = cp.asarray(Y)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = cp.sum(cp.abs(X - Y), axis=1)
+    else:
+        result = cp.sum(cp.abs(X - Y))
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        evt_total_end.synchronize()
+        total_time = cp.cuda.get_elapsed_time(evt_total_start, evt_total_end)
+        mem_time = cp.cuda.get_elapsed_time(evt_mem_start, evt_mem_end)
+        comp_time = cp.cuda.get_elapsed_time(evt_comp_start, evt_comp_end)
+        print(f"[distance_manhattan_CUPY] Total: {total_time:.3f} ms | Transfer: {mem_time:.3f} ms | Compute: {comp_time:.3f} ms")
+    return result
 
-    return cp.sum(cp.abs(X - Y))
 
 # ------------------------------------------------------------------------------------------------
 # SECTION I B: TRITON DISTANCE FUNCTIONS 
@@ -722,162 +752,226 @@ def distance_l1_triton(X, Y):
 # ------------------------------------------------------------------------------------------------
 
 def to_tensor_and_device(X, device="cuda"):
-    """
-    Convert numpy array or PyTorch tensor to the specified device (GPU/CPU).
-    
-    Parameters:
-    X (numpy.ndarray or torch.Tensor): The input array.
-    device (torch.device): The target device (either CPU or CUDA).
-    
-    Returns:
-    torch.Tensor: The tensor moved to the target device.
-    """
     if isinstance(X, np.ndarray):
         X = torch.from_numpy(X)
-    
-    # Ensure tensor is moved to the correct device
     return X.to(device)
 
-def distance_cosine_torch(X, Y, device="cuda"):
-    """
-    Compute the cosine distance between two vectors.
-    
-    Parameters:
-    X (numpy.ndarray or torch.Tensor): First input array (vector).
-    Y (numpy.ndarray or torch.Tensor): Second input array (vector).
-    device (torch.device): The device (CPU or CUDA) to perform the computation on.
-
-    Returns:
-    torch.Tensor: The cosine distance between the two input vectors.
-    """
+def distance_cosine_torch(X, Y, device="cuda", profile=False):
+    if profile:
+        evt_total_start = torch.cuda.Event(enable_timing=True)
+        evt_total_end = torch.cuda.Event(enable_timing=True)
+        evt_mem_start = torch.cuda.Event(enable_timing=True)
+        evt_mem_end = torch.cuda.Event(enable_timing=True)
+        evt_comp_start = torch.cuda.Event(enable_timing=True)
+        evt_comp_end = torch.cuda.Event(enable_timing=True)
+        evt_total_start.record()
+        evt_mem_start.record()
     X = to_tensor_and_device(X, device)
     Y = to_tensor_and_device(Y, device)
-
-    # Compute dot product
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
     dot_product = torch.sum(X * Y)
-
-    # Compute norms
     norm_x = torch.norm(X)
     norm_y = torch.norm(Y)
+    result = 1.0 - (dot_product) / (norm_x * norm_y)
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        torch.cuda.synchronize()
+        total = evt_total_start.elapsed_time(evt_total_end)
+        mem = evt_mem_start.elapsed_time(evt_mem_end)
+        comp = evt_comp_start.elapsed_time(evt_comp_end)
+        print(f"[distance_cosine_torch] Total: {total:.3f} ms | Transfer: {mem:.3f} ms | Compute: {comp:.3f} ms")
+    return result
 
-    return 1.0 - (dot_product) / (norm_x * norm_y)
+def to_tensor_and_device(X, device="cuda"):
+    if isinstance(X, np.ndarray):
+        X = torch.from_numpy(X)
+    return X.to(device)
 
-def distance_l2_torch(X, Y, device="cuda"):
-    """
-    Computes the squared Euclidean (L2 squared) distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray or torch.Tensor): First input vector.
-    Y (numpy.ndarray or torch.Tensor): Second input vector.
-    device (torch.device): The device (CPU or CUDA) to perform the computation on.
-
-    Returns:
-    torch.Tensor: Squared Euclidean distance between X and Y.
-    """
+def distance_cosine_torch(X, Y, device="cuda", multiple=False, profile=False):
+    if profile:
+        evt_total_start = torch.cuda.Event(enable_timing=True)
+        evt_total_end = torch.cuda.Event(enable_timing=True)
+        evt_mem_start = torch.cuda.Event(enable_timing=True)
+        evt_mem_end = torch.cuda.Event(enable_timing=True)
+        evt_comp_start = torch.cuda.Event(enable_timing=True)
+        evt_comp_end = torch.cuda.Event(enable_timing=True)
+        evt_total_start.record()
+        evt_mem_start.record()
     X = to_tensor_and_device(X, device)
     Y = to_tensor_and_device(Y, device)
-    return torch.sum((X - Y) ** 2)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        dot_product = torch.sum(X * Y, dim=1)
+        norm_x = torch.norm(X, dim=1)
+        norm_y = torch.norm(Y, dim=1)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    else:
+        dot_product = torch.sum(X * Y)
+        norm_x = torch.norm(X)
+        norm_y = torch.norm(Y)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        torch.cuda.synchronize()
+        total = evt_total_start.elapsed_time(evt_total_end)
+        mem = evt_mem_start.elapsed_time(evt_mem_end)
+        comp = evt_comp_start.elapsed_time(evt_comp_end)
+        print(f"[distance_cosine_torch] Total: {total:.3f} ms | Transfer: {mem:.3f} ms | Compute: {comp:.3f} ms")
+    return result
 
-def distance_dot_torch(X, Y, device="cuda"):
-    """
-    Computes the dot product distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray or torch.Tensor): First input vector.
-    Y (numpy.ndarray or torch.Tensor): Second input vector.
-    device (torch.device): The device (CPU or CUDA) to perform the computation on.
-
-    Returns:
-    torch.Tensor: The negative dot product distance.
-    """
+def distance_l2_torch(X, Y, device="cuda", multiple=False, profile=False):
+    if profile:
+        evt_total_start = torch.cuda.Event(enable_timing=True)
+        evt_total_end = torch.cuda.Event(enable_timing=True)
+        evt_mem_start = torch.cuda.Event(enable_timing=True)
+        evt_mem_end = torch.cuda.Event(enable_timing=True)
+        evt_comp_start = torch.cuda.Event(enable_timing=True)
+        evt_comp_end = torch.cuda.Event(enable_timing=True)
+        evt_total_start.record()
+        evt_mem_start.record()
     X = to_tensor_and_device(X, device)
     Y = to_tensor_and_device(Y, device)
-    return -torch.sum(X * Y)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = torch.norm(X - Y, dim=1)
+    else:
+        result = torch.norm(X - Y)
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        torch.cuda.synchronize()
+        total = evt_total_start.elapsed_time(evt_total_end)
+        mem = evt_mem_start.elapsed_time(evt_mem_end)
+        comp = evt_comp_start.elapsed_time(evt_comp_end)
+        print(f"[distance_l2_torch] Total: {total:.3f} ms | Transfer: {mem:.3f} ms | Compute: {comp:.3f} ms")
+    return result
 
-def distance_manhattan_torch(X, Y, device="cuda"):
-    """
-    Computes the Manhattan (L1) distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray or torch.Tensor): First input vector.
-    Y (numpy.ndarray or torch.Tensor): Second input vector.
-    device (torch.device): The device (CPU or CUDA) to perform the computation on.
-
-    Returns:
-    torch.Tensor: The Manhattan distance.
-    """
+def distance_dot_torch(X, Y, device="cuda", multiple=False, profile=False):
+    if profile:
+        evt_total_start = torch.cuda.Event(enable_timing=True)
+        evt_total_end = torch.cuda.Event(enable_timing=True)
+        evt_mem_start = torch.cuda.Event(enable_timing=True)
+        evt_mem_end = torch.cuda.Event(enable_timing=True)
+        evt_comp_start = torch.cuda.Event(enable_timing=True)
+        evt_comp_end = torch.cuda.Event(enable_timing=True)
+        evt_total_start.record()
+        evt_mem_start.record()
     X = to_tensor_and_device(X, device)
     Y = to_tensor_and_device(Y, device)
-    return torch.sum(torch.abs(X - Y))
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = -torch.sum(X * Y, dim=1)
+    else:
+        result = -torch.sum(X * Y)
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        torch.cuda.synchronize()
+        total = evt_total_start.elapsed_time(evt_total_end)
+        mem = evt_mem_start.elapsed_time(evt_mem_end)
+        comp = evt_comp_start.elapsed_time(evt_comp_end)
+        print(f"[distance_dot_torch] Total: {total:.3f} ms | Transfer: {mem:.3f} ms | Compute: {comp:.3f} ms")
+    return result
+
+def distance_manhattan_torch(X, Y, device="cuda", multiple=False, profile=False):
+    if profile:
+        evt_total_start = torch.cuda.Event(enable_timing=True)
+        evt_total_end = torch.cuda.Event(enable_timing=True)
+        evt_mem_start = torch.cuda.Event(enable_timing=True)
+        evt_mem_end = torch.cuda.Event(enable_timing=True)
+        evt_comp_start = torch.cuda.Event(enable_timing=True)
+        evt_comp_end = torch.cuda.Event(enable_timing=True)
+        evt_total_start.record()
+        evt_mem_start.record()
+    X = to_tensor_and_device(X, device)
+    Y = to_tensor_and_device(Y, device)
+    if profile:
+        evt_mem_end.record()
+        evt_comp_start.record()
+    if multiple:
+        result = torch.sum(torch.abs(X - Y), dim=1)
+    else:
+        result = torch.sum(torch.abs(X - Y))
+    if profile:
+        evt_comp_end.record()
+        evt_total_end.record()
+        torch.cuda.synchronize()
+        total = evt_total_start.elapsed_time(evt_total_end)
+        mem = evt_mem_start.elapsed_time(evt_mem_end)
+        comp = evt_comp_start.elapsed_time(evt_comp_end)
+        print(f"[distance_manhattan_torch] Total: {total:.3f} ms | Transfer: {mem:.3f} ms | Compute: {comp:.3f} ms")
+    return result
 
 
 # ------------------------------------------------------------------------------------------------
 # SECTION I D: CPU DISTANCE FUNCTIONS   
 # ------------------------------------------------------------------------------------------------
 
-def distance_l2_cpu(X, Y):
-    """
-    Computes the squared Euclidean (L2 squared) distance between two vectors.
+def distance_l2_cpu(X, Y, multiple=False, profile=False):
+    if profile:
+        start = time.perf_counter()
+    if multiple:
+        result = np.linalg.norm(X - Y, axis=1)
+    else:
+        result = np.linalg.norm(X - Y)
+    if profile:
+        end = time.perf_counter()
+        print(f"[distance_l2_cpu] Total Time: {(end - start) * 1000:.3f} ms")
+    return result
 
-    Parameters:
-    X (numpy.ndarray): First input vector.
-    Y (numpy.ndarray): Second input vector.
+def distance_cosine_cpu(X, Y, multiple=False, profile=False):
+    if profile:
+        start = time.perf_counter()
+    if multiple:
+        dot_product = np.sum(X * Y, axis=1)
+        norm_x = np.linalg.norm(X, axis=1)
+        norm_y = np.linalg.norm(Y, axis=1)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    else:
+        dot_product = np.sum(X * Y)
+        norm_x = np.linalg.norm(X)
+        norm_y = np.linalg.norm(Y)
+        result = 1.0 - (dot_product / (norm_x * norm_y))
+    if profile:
+        end = time.perf_counter()
+        print(f"[distance_cosine_cpu] Total Time: {(end - start) * 1000:.3f} ms")
+    return result
 
-    Returns:
-    numpy.ndarray: Squared Euclidean distance between X and Y.
-    """
-    return np.linalg.norm(X - Y)
+def distance_dot_cpu(X, Y, multiple=False, profile=False):
+    if profile:
+        start = time.perf_counter()
+    if multiple:
+        result = -np.sum(X * Y, axis=1)
+    else:
+        result = -np.sum(X * Y)
+    if profile:
+        end = time.perf_counter()
+        print(f"[distance_dot_cpu] Total Time: {(end - start) * 1000:.3f} ms")
+    return result
 
-def distance_cosine_cpu(X, Y):
-    """
-    Compute the cosine distance between two vectors.
+def distance_manhattan_cpu(X, Y, multiple=False, profile=False):
+    if profile:
+        start = time.perf_counter()
+    if multiple:
+        result = np.sum(np.abs(X - Y), axis=1)
+    else:
+        result = np.sum(np.abs(X - Y))
+    if profile:
+        end = time.perf_counter()
+        print(f"[distance_manhattan_cpu] Total Time: {(end - start) * 1000:.3f} ms")
+    return result
+
     
-    Parameters:
-    X (numpy.ndarray): First input array (vector) of shape (d,).
-    Y (numpy.ndarray): Second input array (vector) of shape (d,).
-
-    Returns:
-    numpy.ndarray: The cosine distance between the two input vectors.
-    """
-        
-    # Compute dot product
-    dot_product = np.sum(X*Y)
-
-    # Compute norms
-    norm_x = np.linalg.norm(X)
-    norm_y = np.linalg.norm(Y)
-
-    return 1.0 - (dot_product) / (norm_x * norm_y)  
-
-def distance_dot_cpu(X, Y):
-    """
-    Computes the dot product distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray): First input vector.
-    Y (numpy.ndarray): Second input vector.
-
-    Returns:
-    numpy.ndarray: The negative dot product.
-    """
-    answer = - np.sum(X*Y)
-
-    return answer
-
-def distance_manhattan_cpu(X, Y):
-    """
-    Computes the Manhattan (L1) distance between two vectors.
-
-    Parameters:
-    X (numpy.ndarray): First input vector.
-    Y (numpy.ndarray): Second input vector.
-
-    Returns:
-    numpy.ndarray: The Manhattan distance.
-    """
-
-    answer = np.sum(np.abs(X - Y))
-    return answer
 
 
 ################################################################################################################################
@@ -2549,22 +2643,22 @@ def our_kmeans_L2_CUPY_updated_profiled(N, D, A, K, scaling_factor=1, num_stream
 
                 A_batch = A_buf[:batch_size]
 
-                # ev = record_event("A_norm")
-                # A_norm = cp.sum(A_batch ** 2, axis=1, keepdims=True)
-                # finish_event(ev)
+                ev = record_event("A_norm")
+                A_norm = cp.sum(A_batch ** 2, axis=1, keepdims=True)
+                finish_event(ev)
 
-                # ev = record_event("C_norm")
-                # C_norm = cp.sum(centroids_gpu ** 2, axis=1, keepdims=True).T
-                # finish_event(ev)
+                ev = record_event("C_norm")
+                C_norm = cp.sum(centroids_gpu ** 2, axis=1, keepdims=True).T
+                finish_event(ev)
 
-                # ev = record_event("Dot")
-                # dot = cp.matmul(A_batch, centroids_gpu.T, out=dot_buf[:batch_size].reshape((batch_size, K)))
-                # # dot = A_batch @ centroids_gpu.T 
-                # finish_event(ev)
+                ev = record_event("Dot")
+                dot = cp.matmul(A_batch, centroids_gpu.T, out=dot_buf[:batch_size].reshape((batch_size, K)))
+                # dot = A_batch @ centroids_gpu.T 
+                finish_event(ev)
 
                 ev = record_event("Distance matrix calc")
-                # distances = A_norm + C_norm - 2 * dot
-                distances = cp.linalg.norm(A_batch[:, None] - centroids_gpu, axis=2)
+                distances = A_norm + C_norm - 2 * dot
+                # distances = cp.linalg.norm(A_batch[:, None] - centroids_gpu, axis=2)
                 finish_event(ev)
 
                 if profile:
@@ -2898,6 +2992,8 @@ def our_kmeans_L2_CUPY_updated_profiled(N, D, A, K, scaling_factor=1, num_stream
 #     return cp.asnumpy(cluster_assignments), cp.asnumpy(centroids_gpu)
 
 
+
+
 def our_kmeans_L2_TORCH(N, D, A, K, scaling_factor=1, num_streams=2, max_iters=10, profile=False, A_threshold_GB=8.0, device="cuda"):
     if device != "cuda":
         raise ValueError("This implementation requires a CUDA device for stream optimization.")
@@ -2966,7 +3062,7 @@ def our_kmeans_L2_TORCH(N, D, A, K, scaling_factor=1, num_streams=2, max_iters=1
                 if use_full_gpu_load:
                     A_buf[:batch_size].copy_(A_gpu[start:end])
                 else:
-                    A_buf[:batch_size].copy_(torch.from_numpy(A[start:end]).to(device))
+                    A_buf[:batch_size].copy_(torch.from_numpy(A[start:end]).to(device, non_blocking=True), non_blocking=True)
                 finish_event(ev)
                 A_batch = A_buf[:batch_size]
 
@@ -3230,6 +3326,51 @@ def our_kmeans_cosine(N, D, A, K):
         centroids_gpu = updated_centroids
 
     return cluster_assignments, centroids_gpu
+
+
+# ---------- CuVS WRAPPERS ----------
+
+def to_cupy(A: np.ndarray) -> cp.ndarray:
+    return cp.asarray(A)
+
+def cuvs_kmeans(A, K):
+
+    # Initialize and fit KMeans
+    kmeans = KMeans(n_clusters=K, random_state=42)
+    kmeans.fit(A)
+
+    # Get cluster centers and labels
+    centers = kmeans.cluster_centers_
+    labels = kmeans.labels_
+
+    return labels, centers
+
+def cuvs_kmeans_average(A: np.ndarray, K: int, repeat=5):
+    A_cp = to_cupy(A)
+    #warmup
+    _ = cuvs_kmeans(A_cp, K)
+    cp.cuda.Stream.null.synchronize()
+    total_time = 0
+    for _ in range(repeat):
+        start = time.perf_counter()
+        result = cuvs_kmeans(A_cp, K)
+        cp.cuda.Stream.null.synchronize()
+        end = time.perf_counter()
+        time = end - start
+        total_time += time
+    avg_time = total_time / repeat
+    print(f"CuVS KMeans time: {end - start:.6f} seconds")
+    return "CuVS", avg_time, result
+
+def cuvs_knn_wrapper(A: np.ndarray, k: int):
+    A_cp = to_cupy(A)
+    start = time.perf_counter()
+    distances, indices = cuvs_knn(A_cp, A_cp, k)
+    end = time.perf_counter()
+    print(f"CuVS KNN time: {end - start:.6f} seconds")
+    return distances, indices
+
+
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.2 code here
 # ------------------------------------------------------------------------------------------------
@@ -3349,7 +3490,7 @@ def our_ann_cosine(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 #Testing Distance Wrapper
 
-def test_distance_wrapper(func, X, Y, repeat=10):
+def test_distance_wrapper(func, X, Y, repeat=10, multiple=False, profile=False):
     """
     Wrapper function to test distance functions.
     
@@ -3364,13 +3505,18 @@ def test_distance_wrapper(func, X, Y, repeat=10):
     
     
     #Warm up
-    result = func(X, Y)
+    result = func(X, Y, multiple=multiple, profile=False)
+    cp.cuda.Stream.null.synchronize()
     torch.cuda.synchronize()
 
     start = time.time()
     for _ in range(repeat):
-        result = func(X, Y)
+        result = func(X, Y, multiple=multiple, profile=profile)
         torch.cuda.synchronize()  # Ensure all GPU computations are finished
+        #clear memory
+        torch.cuda.empty_cache()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.cuda.Stream.null.synchronize()
     end = time.time()
     avg_time = ((end - start) / repeat) * 1000  # Runtime in ms
     print(f"Distance Function: {func.__name__}, Result: {result}, Time: {avg_time:.6f} milliseconds.")
@@ -3558,7 +3704,7 @@ def get_backend(fn):
     elif 'cpu' in fn_lower:
         return 'CPU'
     else:
-        return 'Unknown'
+        return 'CuVs'
 
 def get_metric(fn):
     fn_lower = fn.__name__.lower()
@@ -3570,8 +3716,71 @@ def get_metric(fn):
         return 'Cosine'
     elif 'dot' in fn_lower:
         return 'Dot'
-    return 'Unknown'
+    return 'CuVS'
 
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import seaborn as sns
+
+# Set a modern seaborn style
+sns.set_theme(style="whitegrid", font_scale=1.2)
+
+# Optional: use a specific color palette
+colors = sns.color_palette("colorblind")  # good for accessibility
+
+def plot_distance_results(results_list, vector_sizes, single=True):
+    for idx, (function_type, function_list) in enumerate(results_list.items()):
+        plt.figure(figsize=(8, 7.5))  # bigger, cleaner layout
+
+        color_idx = 0
+        for function in function_list:
+            for function_name, result in function.items():
+                plt.plot(
+                    vector_sizes,
+                    result,
+                    label=function_name.replace('_', ' ').upper(),
+                    color=colors[color_idx % len(colors)],
+                    linewidth=2.5,
+                    marker='o',
+                    markersize=5,
+                )
+                color_idx += 1
+
+        plt.xscale('log', base=2)
+        # plt.yscale('log')
+
+        # Log ticks with base-2 labels
+        plt.gca().xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"$2^{{{int(np.log2(x))}}}$"))
+
+        plt.xlabel("Vector Size (log scale)", labelpad=10)
+        plt.ylabel("Time (s) (log scale, descending)", labelpad=10)
+        # plt.gca().invert_yaxis() 
+        plt.title(f"Average Time to compute {function_type} distance between two random Numpy vectors", fontsize=14, weight="bold")
+
+        plt.legend(title="Implementation", loc="best", frameon=True)
+        plt.tight_layout()
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+                # Add caption below the plot
+        plt.figtext(
+            0.5, -0.12,
+            "In the case of the GPU accelerated libraries, these timings are inclusive of the memory transfer in the GPU. "
+            "As we can see here, CPU performance is better at lower dimensions and scales similarly with CuPy and Triton as the memory increases.\n\n"
+            "We note here that this is because there is only one distance calculation being carried out and, despite parallelising across segments within the vectors "
+            "and reducing these partial sums, the memory overhead involved means that there is no significant benefit from utilizing the GPU for a single distance calculation.",
+            wrap=True,
+            ha="center",
+            fontsize=10
+        )
+        plt.show()
+        # Save the plot
+        time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if single:
+            file_name = f"results/{time}_{function_type}_distance_plot.png"
+        else:
+            file_name = f"results/{time}_multiple_{function_type}_distance_plot.png"
+        print(f"Plot saved to {file_name}")
+        plt.savefig(file_name, dpi=300, bbox_inches='tight')
+        plt.close() 
 
 def plot_results(results, save_dir=None, file_name=None, show=True):
     """
@@ -3646,11 +3855,342 @@ def plot_results(results, save_dir=None, file_name=None, show=True):
         plt.show()
     else:
         plt.close()
-def plot_graph():
-    #load pandas dataframe from csv
-    df = pd.read_csv('results_plots/with_cpu_results.csv')
-    plot_results(df, save_dir='results_plots', file_name='with_cpu_results.pdf', show=True)
 
+
+def plot_results_separately(results, save_dir=None, file_prefix=None, show=True):
+    """
+    Plot benchmarking results as individual bar charts per distance metric.
+
+    Parameters:
+    - results: List of dicts with keys: Function, Metric, Backend, Vector Count, Dim, Time (ms)
+    - save_dir: Optional directory to save the plots
+    - file_prefix: Optional prefix for file names (e.g., 'plot'); defaults to 'plot'
+    - show: Whether to display the plots (default: True)
+    """
+    df = pd.DataFrame(results)
+
+    if df.empty:
+        print("⚠️ No results to plot.")
+        return
+
+    df['Vector Count Label'] = df['Vector Count'].apply(lambda x: f"{x//1000}K")
+    df['Metric'] = pd.Categorical(df['Metric'], ['L1', 'L2', 'Cosine', 'Dot'])
+    df['Vector Count Label'] = pd.Categorical(
+        df['Vector Count Label'],
+        sorted(df['Vector Count Label'].unique(), key=lambda x: int(x.replace('K', '')))
+    )
+    df['Backend'] = df['Backend'].astype(str)
+
+    sns.set_theme(style='whitegrid', font_scale=1.4)
+
+    file_prefix = file_prefix or 'plot'
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for metric in ['L1', 'L2', 'Cosine', 'Dot']:
+        subset = df[df['Metric'] == metric]
+        if subset.empty:
+            continue
+
+        plt.figure(figsize=(6, 4))
+        ax = sns.barplot(
+            data=subset,
+            x='Vector Count Label',
+            y='Time (ms)',
+            hue='Backend',
+            palette='Set2'
+        )
+
+        ax.set_title(f"{metric} Distance")
+        ax.set_xlabel("Vector Count")
+        ax.set_ylabel("Execution Time (ms)")
+
+        # Annotate bars
+        for p in ax.patches:
+            height = p.get_height()
+            if height > 0:
+                ax.annotate(
+                    f'{int(height + 0.5)}',
+                    (p.get_x() + p.get_width() / 2., height + 0.02 * height),
+                    ha='center', va='bottom',
+                    fontsize=7,
+                    color='black'
+                )
+
+        plt.tight_layout()
+
+        # Save each plot
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            file_name = f"{file_prefix}_{metric.lower()}_{timestamp}.png"
+            full_path = os.path.join(save_dir, file_name)
+            plt.savefig(full_path, bbox_inches='tight', pad_inches=0.3)
+            print(f"✅ Saved {metric} plot to {full_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+def plot_knn_graph():
+    #load pandas dataframe from csv
+    df = pd.read_csv('results/with_cpu_results.csv')
+    plot_results_separately(df, save_dir='results', show=True)
+
+from datetime import datetime
+import os
+
+def plot_kmeans_timings_with_speedup(df, show_speedup=True):
+    sns.set_theme(style="whitegrid")
+    dims = [2, 1024]
+
+    for dim in dims:
+        df_dim = df[df['Dim'] == dim].copy()
+        df_dim = df_dim.sort_values(by=["Vector Count", "Backend"])
+
+        plt.figure(figsize=(14, 6))
+        ax = sns.barplot(
+            data=df_dim,
+            x="Vector Count",
+            y="Time (ms)",
+            hue="Backend"
+        )
+        # plt.yscale("log")
+        plt.title(f"K-Means Runtime by Backend (D = {dim})")
+        plt.xlabel("Vector Count")
+        plt.ylabel("Time (ms, log scale)")
+        plt.legend(title="Backend")
+
+        if show_speedup:
+            grouped = df_dim.groupby("Vector Count")
+            for x_idx, (vec_count, group) in enumerate(grouped):
+                cpu_row = group[group["Backend"] == "CPU"]
+                if cpu_row.empty:
+                    continue
+                cpu_time = cpu_row["Time (ms)"].values[0]
+
+                for backend in ["Torch", "CuPy"]:
+                    if backend in group["Backend"].values:
+                        gpu_time = group[group["Backend"] == backend]["Time (ms)"].values[0]
+                        speedup = cpu_time / gpu_time
+                        y = gpu_time
+                        x_offset = -0.25 if backend == "Torch" else 0.25
+                        ax.annotate(
+                            f"{speedup:.1f}×",
+                            xy=(x_idx + x_offset, y),
+                            xytext=(x_idx + x_offset, y * 1.5),
+                            textcoords="data",
+                            ha="center",
+                            fontsize=9,
+                            bbox=dict(boxstyle="round,pad=0.2", fc="yellow", alpha=0.3),
+                            arrowprops=dict(arrowstyle="->", lw=1)
+                        )
+
+        plt.tight_layout()
+
+        # Save each figure uniquely by dimension
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        save_path = os.path.join(RESULTS_DIR, f"kmeans_timings_D{dim}_{timestamp}.png")
+        plt.savefig(save_path, dpi=300)
+        print(f"Saved plot for D={dim} to {save_path}")
+        plt.show()
+
+def plot_kmeans_timings(file_name, show_speedup=False):
+    file_path = os.path.join(RESULTS_DIR, file_name)
+    #load in csv file
+    df = pd.read_csv(file_path)
+    #plot the results
+    plot_kmeans_timings_with_speedup(df, show_speedup=show_speedup)
+
+def csv_to_results_list_and_vector_sizes(csv_path):
+    
+
+    df = pd.read_csv(csv_path)
+
+    if not {'Function Type', 'Function Name', 'Vector Size', 'Time (s)'}.issubset(df.columns):
+        raise ValueError("CSV must contain columns: 'Function Type', 'Function Name', 'Vector Size', 'Time (s)'")
+
+    results_list = {}
+    vector_sizes = sorted(df["Vector Size"].unique())
+
+    grouped = df.groupby(["Function Type", "Function Name"])
+
+    for (function_type, function_name), group in grouped:
+        group_sorted = group.sort_values("Vector Size")
+        timings = list(group_sorted["Time (s)"].values)
+
+        if function_type not in results_list:
+            results_list[function_type] = []
+
+        results_list[function_type].append({function_name: timings})
+
+    return results_list, vector_sizes
+
+def test_distance():
+    np.random.seed(1967)
+    profile = False
+    N = 1000
+    vector_sizes = [2**i for i in (1,16)]
+    X_single_list = [np.random.rand(size,) for size in vector_sizes]
+    
+    Y_single_list = [np.random.rand(size,) for size in vector_sizes]
+
+    X_array_list = [np.random.rand(N, size) for size in vector_sizes]
+    Y_array_list = [np.random.rand(N, size) for size in vector_sizes]
+
+    functions = {
+    "L2": [
+        distance_l2_CUPY,
+        # distance_l2_triton,
+        distance_l2_cpu,
+        distance_l2_torch,
+    ],
+    "L1": [
+        distance_manhattan_CUPY,
+        # distance_l1_triton,
+        distance_manhattan_cpu,
+        distance_manhattan_torch,
+    ],
+    "Cosine": [
+        distance_cosine_CUPY,
+        # distance_cosine_triton,
+        distance_cosine_cpu,
+        distance_cosine_torch,
+    ],
+    "Dot Product": [
+        distance_dot_CUPY,
+        # distance_dot_triton,
+        distance_dot_cpu,
+        distance_dot_torch,
+    ],
+    }
+    def results_list_to_csv(results_list, vector_sizes, save_path="results/distance_timings.csv"):
+        records = []
+
+        for function_type, function_list in results_list.items():
+            for function_dict in function_list:
+                for function_name, timings in function_dict.items():
+                    for size, timing in zip(vector_sizes, timings):
+                        records.append({
+                            "Function Type": function_type,
+                            "Function Name": function_name,
+                            "Vector Size": size,
+                            "Time (s)": timing
+                        })
+
+        df = pd.DataFrame(records)
+        df.to_csv(save_path, index=False)
+        print(f"Saved results to {save_path}")
+        return df
+    
+    results_list = {}
+    for function_type, function_list in functions.items():
+        results_list[function_type]= []
+        for function in function_list:
+            inner_results_item = []
+            for i in range(len(vector_sizes)):
+                size = vector_sizes[i]
+                X = X_single_list[i]
+                Y = Y_single_list[i]
+                result = test_distance_wrapper(function, X, Y, repeat=10, multiple = False, profile=profile)
+                inner_results_item.append(result[2])
+            results_item = {function.__name__: inner_results_item}
+            results_list[function_type].append(results_item)
+    for function_type, function_list in results_list.items():
+        print(function_type)
+        for function in function_list:
+            for function_name, result in function.items():
+                print(f"{function_name}: {result}")
+        print()
+    #save results to csv
+    single_results_df = results_list_to_csv(results_list, vector_sizes, save_path=f"{RESULTS_DIR}/distance_single_results.csv")
+    plot_distance_results(results_list, vector_sizes)
+
+    results_list_multiple = {}
+    for function_type, function_list in functions.items():
+        results_list_multiple[function_type]= []
+        for function in function_list:
+            inner_results_item = []
+            for i in range(len(vector_sizes)):
+                size = vector_sizes[i]
+                X = X_array_list[i]
+                Y = Y_array_list[i]
+                result = test_distance_wrapper(function, X, Y, repeat=10, multiple=True, profile=profile)
+                inner_results_item.append(result[2])
+            results_item = {function.__name__: inner_results_item}
+            results_list_multiple[function_type].append(results_item)
+    for function_type, function_list in results_list_multiple.items():
+        print(function_type)
+        for function in function_list:
+            for function_name, result in function.items():
+                print(f"{function_name}: {result}")
+        print()
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    mutliple_results_file_path = os.path.join('results', f'distance_multiple_results_{current_time}.csv')
+    multiple_results_df = results_list_to_csv(results_list_multiple, vector_sizes, save_path=mutliple_results_file_path)
+    plot_distance_results(results_list_multiple, vector_sizes, single=False)
+
+import pandas as pd
+
+
+def compute_speedup_multiples_formatted(csv_path, print_results=True):
+    try:
+        from tabulate import tabulate
+        use_tabulate = True
+    except ImportError:
+        use_tabulate = False
+
+    df = pd.read_csv(csv_path)
+
+    if not {'Function Type', 'Function Name', 'Vector Size', 'Time (s)'}.issubset(df.columns):
+        raise ValueError("CSV must contain: 'Function Type', 'Function Name', 'Vector Size', 'Time (s)'")
+
+    def infer_backend(name):
+        name = name.lower()
+        if 'torch' in name:
+            return 'Torch'
+        elif 'cupy' in name:
+            return 'CuPy'
+        elif 'cpu' in name:
+            return 'CPU'
+        return 'Unknown'
+
+    df["Backend"] = df["Function Name"].apply(infer_backend)
+
+    results = []
+
+    for function_type in df["Function Type"].unique():
+        for vec_size in sorted(df["Vector Size"].unique()):
+            subset = df[(df["Function Type"] == function_type) & (df["Vector Size"] == vec_size)]
+
+            cpu_row = subset[subset["Backend"] == "CPU"]
+            torch_row = subset[subset["Backend"] == "Torch"]
+            cupy_row = subset[subset["Backend"] == "CuPy"]
+
+            cpu_time = float(cpu_row["Time (s)"].values[0]) if not cpu_row.empty else None
+            torch_time = float(torch_row["Time (s)"].values[0]) if not torch_row.empty else None
+            cupy_time = float(cupy_row["Time (s)"].values[0]) if not cupy_row.empty else None
+
+            torch_speedup = f"{cpu_time / torch_time:.2f}×" if cpu_time and torch_time else "N/A"
+            cupy_speedup = f"{cpu_time / cupy_time:.2f}×" if cpu_time and cupy_time else "N/A"
+
+            results.append({
+                "Function Type": function_type,
+                "Vector Size": int(vec_size),
+                "CPU Time (s)": round(cpu_time, 6) if cpu_time else "N/A",
+                "Torch Speedup": torch_speedup,
+                "CuPy Speedup": cupy_speedup
+            })
+
+    speedup_df = pd.DataFrame(results)
+
+    if print_results:
+        print("\n=== Speedup Multiples (CPU vs Torch and CuPy) ===\n")
+        if use_tabulate:
+            print(tabulate(speedup_df, headers='keys', tablefmt='fancy_grid', showindex=False))
+        else:
+            print(speedup_df.to_string(index=False))
+
+    return speedup_df
 
 def test_knn():
     N = 4_000_000
@@ -3815,18 +4355,20 @@ def compare_knn_test():
         print(df[['Backend', 'Metric', 'Vector Count']].drop_duplicates())
         results_df.to_csv(os.path.join(RESULTS_DIR, 'with_cpu_knn_results.csv'), index=False)
         #Create plots for the function times
-        plot_results(results, save_dir=RESULTS_DIR, file_name='with_cpu_knn_plot.pdf', show=True)
+        plot_results(results, save_dir=RESULTS_DIR, file_name='with_cpu_knn_plot.png', show=True)
 
 def test_k_means():
     funcs_scaling_pairs = [
         (our_kmeans_L2_CUPY_updated_profiled, 0.025),
         (our_kmeans_L2_TORCH, 0.08),
-        (our_k_means_L2_cpu,1)
+        (cuvs_kmeans, 1)
+        # (our_k_means_L2_cpu,1)
         # our_kmeans_L2_CUPY_updated_profiled
         # our_kmeans_L2
     ]
-    N_array = [4_000_000, 4_000, 40_000, 400_000, 1_000_000, 2_000_000]
-    D_array = [2, 1024]
+    # N_array = [4_000_000, 4_000, 40_000, 400_000, 1_000_000, 2_000_000]
+    N_array = [2_000_000]
+    D_array = [1024]
     # A = np.random.rand(N, D).astype(np.float32)
     K = 10
     profile = False
@@ -3842,12 +4384,16 @@ def test_k_means():
                 A = np.random.rand(n, D).astype(np.float32)
                 print(f"Testing function: {func.__name__}")
                 print(f"Testing N: {n} D: {D} K: {K}")
-                name, result, avg_time = test_kmeans_wrapper(func, n, D, A, K, repeat=repeat, scaling_factor=scaling_factor, num_streams=num_streams, profile=profile)
-                torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
-                #release memory
-                cp.get_default_memory_pool().free_all_blocks()
-                del A
-                cp.cuda.Stream.null.synchronize()
+                if not "cuvs" in func.__name__:
+                    name, result, avg_time = test_kmeans_wrapper(func, n, D, A, K, repeat=repeat, scaling_factor=scaling_factor, num_streams=num_streams, profile=profile)
+                    torch.cuda.synchronize()  # Ensure all GPU computations are finished before measuring time
+                    #release memory
+                    cp.get_default_memory_pool().free_all_blocks()
+                    del A
+                    cp.cuda.Stream.null.synchronize()
+                else:
+                    name, result, avg_time = cuvs_kmeans_average(A, K, repeat=repeat)
+                    torch.cuda.synchronize()
                 results.append({
                         'Function': func.__name__,  # or a label string
                         'Metric': get_metric(func),
@@ -3863,8 +4409,9 @@ def test_k_means():
     results_df[['Function', 'Metric', 'Backend', 'Vector Count', 'Dim', 'Time (ms)']]
     .drop_duplicates()
     .sort_values(by=['Dim', 'Vector Count'])
-)
-    results_df.to_csv(os.path.join(RESULTS_DIR, 'with_cpu_kmeans_results.csv'), index=False)
+    )
+    time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    results_df.to_csv(os.path.join(RESULTS_DIR, time,'with_cpu_kmeans_results.csv'), index=False)
 
 def tune_scaling_factor():
     #TORCH BEST = 0.08
@@ -3875,8 +4422,8 @@ def tune_scaling_factor():
         # our_kmeans_L2_CUPY_updated_profiled
         # our_kmeans_L2
     ]
-    N = 4_000_000
-    D = 1024
+    N = 1_000_000
+    D = 512
     A = np.random.rand(N, D).astype(np.float32)
     K = 10
     # scaling_factor = 0.25
@@ -3914,14 +4461,23 @@ def tune_scaling_factor():
         results_df.to_csv(os.path.join(RESULTS_DIR, f'kmeans_results_TORCH_ONLY_{current_time}.csv'), index=False)
 
 
-
+def plot_distance_from_csv():
+    # file_path_2 = 'results/distance_single_results.csv'
+    file_path = 'results/distance_multiple_results_2025-04-13_19-56-58.csv'
+    compute_speedup_multiples_formatted(file_path)
+    # results_list, vector_sizes = csv_to_results_list_and_vector_sizes(file_path_2)
+    # plot_distance_results(results_list, vector_sizes)
 
 
 
 if __name__ == "__main__":
     # compare_knn_test()
-    # plot_graph()
-    test_k_means()
+    plot_knn_graph()
+    # test_k_means()
+    # test_distance()
+    # plot_distance_from_csv()
+    
+    # plot_kmeans_timings('with_cpu_kmeans_results.csv', show_speedup=False)
     # tune_scaling_factor()
     # test_knn()
     # tune_batch_size_knn()

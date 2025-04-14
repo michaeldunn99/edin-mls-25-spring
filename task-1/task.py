@@ -3493,6 +3493,57 @@ def compute_speedup_multiples_formatted(csv_path, print_results=True):
 
     return speedup_df
 
+import pandas as pd
+
+def compute_kmeans_speedup_filtered(csv_path, dims=(2, 1024), vec_counts=(4000, 4000000), print_results=True):
+    try:
+        from tabulate import tabulate
+        use_tabulate = True
+    except ImportError:
+        use_tabulate = False
+
+    df = pd.read_csv(csv_path)
+
+    required_columns = {'Function', 'Metric', 'Backend', 'Vector Count', 'Dim', 'Time (ms)'}
+    if not required_columns.issubset(df.columns):
+        raise ValueError(f"CSV must contain: {required_columns}")
+
+    df['Backend'] = df['Backend'].str.strip().str.capitalize()
+
+    results = []
+
+    for dim in dims:
+        for vec_count in vec_counts:
+            subset = df[(df['Dim'] == dim) & (df['Vector Count'] == vec_count)]
+
+            cpu_time = subset[subset['Backend'] == 'Cpu']['Time (ms)'].mean()
+            torch_time = subset[subset['Backend'] == 'Torch']['Time (ms)'].mean()
+            cupy_time = subset[subset['Backend'] == 'Cupy']['Time (ms)'].mean()
+
+            torch_speedup = f"{cpu_time / torch_time:.2f}×" if cpu_time and torch_time else "N/A"
+            cupy_speedup = f"{cpu_time / cupy_time:.2f}×" if cpu_time and cupy_time else "N/A"
+
+            results.append({
+                "Dim": dim,
+                "Vector Count": vec_count,
+                "CPU Time (ms)": round(cpu_time, 3) if not pd.isna(cpu_time) else "N/A",
+                "Torch Time (ms)": round(torch_time, 3) if not pd.isna(torch_time) else "N/A",
+                "CuPy Time (ms)": round(cupy_time, 3) if not pd.isna(cupy_time) else "N/A",
+                "Torch Speedup": torch_speedup,
+                "CuPy Speedup": cupy_speedup
+            })
+
+    df_out = pd.DataFrame(results)
+
+    if print_results:
+        print("\n=== K-Means Speedup (Filtered by Dim & Vector Count) ===\n")
+        if use_tabulate:
+            print(tabulate(df_out, headers="keys", tablefmt="fancy_grid", showindex=False))
+        else:
+            print(df_out.to_string(index=False))
+
+    return df_out
+
 def test_knn():
     N = 4_000_000
     D = 1024
@@ -3657,16 +3708,16 @@ def compare_knn_test():
 
 def test_k_means():
     funcs_scaling_pairs = [
-        (our_kmeans_L2_CUPY_updated_profiled, 0.025),
+        (our_kmeans_L2_CUPY, 0.025),
         (our_kmeans_L2_TORCH, 0.08),
-        (cuvs_kmeans, 1)
-        # (our_k_means_L2_cpu,1)
+        # (cuvs_kmeans, 1)
+        (our_k_means_L2_cpu,1)
         # our_kmeans_L2_CUPY_updated_profiled
         # our_kmeans_L2
     ]
-    # N_array = [4_000_000, 4_000, 40_000, 400_000, 1_000_000, 2_000_000]
-    N_array = [2_000_000]
-    D_array = [1024]
+    N_array = [4_000_000, 4_000, 40_000, 400_000]
+    # N_array = [2_000_000]
+    D_array = [1024,2]
     # A = np.random.rand(N, D).astype(np.float32)
     K = 10
     profile = False
@@ -3709,7 +3760,7 @@ def test_k_means():
     .sort_values(by=['Dim', 'Vector Count'])
     )
     time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    results_df.to_csv(os.path.join(RESULTS_DIR, time,'with_cpu_kmeans_results.csv'), index=False)
+    results_df.to_csv(os.path.join(RESULTS_DIR,f'{time}_with_cpu_kmeans_results.csv'), index=False)
 
 def tune_scaling_factor():
     #TORCH BEST = 0.08
@@ -3770,8 +3821,9 @@ def plot_distance_from_csv():
 
 if __name__ == "__main__":
     # compare_knn_test()
-    plot_knn_graph()
+    # plot_knn_graph()
     # test_k_means()
+    compute_kmeans_speedup_filtered('results/2025-04-14_09-27-47_with_cpu_kmeans_results.csv')
     # test_distance()
     # plot_distance_from_csv()
     

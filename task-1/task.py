@@ -2644,126 +2644,15 @@ def cuvs_kmeans_average(A: np.ndarray, K: int, repeat=5):
     print(f"CuVS KMeans time: {end - start:.6f} seconds")
     return "CuVS", avg_time, result
 
-def cuvs_knn_wrapper(A: np.ndarray, k: int):
-    A_cp = to_cupy(A)
-    start = time.perf_counter()
-    distances, indices = cuvs_knn(A_cp, A_cp, k)
-    end = time.perf_counter()
-    print(f"CuVS KNN time: {end - start:.6f} seconds")
-    return distances, indices
+# def cuvs_knn_wrapper(A: np.ndarray, k: int):
+#     A_cp = to_cupy(A)
+#     start = time.perf_counter()
+#     distances, indices = cuvs_knn(A_cp, A_cp, k)
+#     end = time.perf_counter()
+#     print(f"CuVS KNN time: {end - start:.6f} seconds")
+#     return distances, indices
 
-# ------------------------------------------------------------------------------------------------
-# SECTION 2.2: ANN FUNCTIONS
-# ------------------------------------------------------------------------------------------------
 
-def our_ann_L2(N, D, A, X, K):
-    # Run KMeans clustering on A to get cluster assignments and centroids
-    num_clusters = 100
-    # Run KMeans to cluster data into K clusters
-    cluster_assignments, centroids_np = our_kmeans_L2(N, D, A, num_clusters)
-    num_clusters = centroids_gpu.shape[0]
-    X_gpu = cp.asarray(X, dtype=cp.float32)
-
-    # Step 1: Find K1 closest centroids (on GPU)
-    distances = cp.linalg.norm(centroids_gpu - X_gpu, axis=1)
-    K1 = num_clusters // 10
-    top_cluster_ids = cp.argpartition(distances, K1)[:K1]
-    top_clusters_set = cp.zeros(num_clusters, dtype=cp.bool_)
-    top_clusters_set[top_cluster_ids] = True
-    mask = top_clusters_set[cluster_assignments]
-    all_indices_gpu = cp.nonzero(mask)[0]
-
-    if all_indices_gpu.size == 0:
-        return np.array([], dtype=np.int32)
-
-    # Copy candidate indices to CPU once
-    all_indices_cpu = cp.asnumpy(all_indices_gpu)
-    candidate_N = all_indices_cpu.shape[0]
-
-    # Allocate final distance buffer
-    final_distances = cp.empty(candidate_N, dtype=cp.float32)
-
-    # Streamed batch KNN on candidate pool (like our_knn_L2_CUPY)
-    gpu_batch_num = 5
-    gpu_batch_size = (candidate_N + gpu_batch_num - 1) // gpu_batch_num
-    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
-    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
-    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
-    D_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
-
-    for i, (start, end) in enumerate(gpu_batches):
-        stream = streams[i]
-        batch_size = end - start
-        with stream:
-            A_device[i][:batch_size].set(A[all_indices_cpu[start:end]])
-            A_batch = A_device[i][:batch_size]
-            D_device[i][:batch_size] = cp.linalg.norm(A_batch - X_gpu, axis=1)
-            final_distances[start:end] = D_device[i][:batch_size]
-
-    cp.cuda.Stream.null.synchronize()
-
-    # Final Top-K selection
-    top_k_indices = cp.argpartition(final_distances, K)[:K]
-    sorted_top_k_indices = top_k_indices[cp.argsort(final_distances[top_k_indices])]
-    final_result = all_indices_cpu[cp.asnumpy(sorted_top_k_indices)]
-    return final_result
-
-def our_ann_cosine(N, D, A, X, K):
-    # Step 0: Build the index (KMeans using cosine distance)
-    num_clusters = 300
-    cluster_assignments, centroids_gpu = our_kmeans_cosine(N, D, A, num_clusters)
-
-    # Step 1: Move query to GPU and normalize it
-    X_gpu = cp.asarray(X, dtype=cp.float32)
-    X_gpu /= cp.linalg.norm(X_gpu) + 1e-8  # Normalize for cosine similarity
-
-    # Step 2: Find K1 closest clusters using cosine similarity
-    K1 = num_clusters // 2
-    centroids_gpu_normed = centroids_gpu / (cp.linalg.norm(centroids_gpu, axis=1, keepdims=True) + 1e-8)
-    similarities = centroids_gpu_normed @ X_gpu
-    top_cluster_ids = cp.argpartition(-similarities, K1)[:K1]  # Use negative to get top-K
-
-    # Step 3: Create mask to select points from top K1 clusters
-    top_clusters_set = cp.zeros(num_clusters, dtype=cp.bool_)
-    top_clusters_set[top_cluster_ids] = True
-    mask = top_clusters_set[cluster_assignments]
-    all_indices_gpu = cp.nonzero(mask)[0]
-
-    if all_indices_gpu.size == 0:
-        return np.array([], dtype=np.int32)
-
-    # Step 4: Move selected candidate vectors to GPU in batches (streamed)
-    all_indices_cpu = cp.asnumpy(all_indices_gpu)
-    candidate_N = len(all_indices_cpu)
-
-    gpu_batch_size = 100_000
-    gpu_batch_num = (candidate_N + gpu_batch_size - 1) // gpu_batch_size
-    gpu_batches = [(i * gpu_batch_size, min((i + 1) * gpu_batch_size, candidate_N)) for i in range(gpu_batch_num)]
-
-    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(gpu_batch_num)]
-    A_device = [cp.empty((gpu_batch_size, D), dtype=cp.float32) for _ in range(gpu_batch_num)]
-    S_device = [cp.empty(gpu_batch_size, dtype=cp.float32) for _ in range(gpu_batch_num)]
-    similarities_final = cp.empty(candidate_N, dtype=cp.float32)
-
-    for i, (start, end) in enumerate(gpu_batches):
-        stream = streams[i]
-        batch_size = end - start
-        with stream:
-            A_device[i][:batch_size].set(A[all_indices_cpu[start:end]])
-            A_batch = A_device[i][:batch_size]
-            # Normalize each vector in the batch
-            A_batch_normed = A_batch / (cp.linalg.norm(A_batch, axis=1, keepdims=True) + 1e-8)
-            S_device[i][:batch_size] = A_batch_normed @ X_gpu
-            similarities_final[start:end] = S_device[i][:batch_size]
-
-    cp.cuda.Stream.null.synchronize()
-
-    # Step 5: Top-K selection using cosine similarity
-    top_k_indices = cp.argpartition(-similarities_final, K)[:K]
-    sorted_top_k = top_k_indices[cp.argsort(-similarities_final[top_k_indices])]
-    final_result = all_indices_cpu[cp.asnumpy(sorted_top_k)]
-
-    return final_result
 
 
 # ------------------------------------------------------------------------------------------------
@@ -3553,21 +3442,8 @@ def test_knn():
     repeat = 5
 
     knn_functions = [           
-        # our_knn_L2_CUPY,
-        # our_knn_L2_CUPY_alt,
-        # # our_knn_cosine_CUPY,
-        # # our_knn_dot_CUPY,
-        # # our_knn_L1_CUPY,
-        # our_knn_L2_TORCH,
-        # our_knn_L1_TORCH,
-        # our_knn_cosine_TORCH,
-        # our_knn_dot_TORCH,
-        # our_knn_L2_CUDA,
-        # our_knn_l2_triton,
-        # our_knn_cosine_triton,
-        # our_knn_dot_triton,
-        # our_knn_l1_triton,
-        our_knn_dot_cpu
+        our_knn_L2_CUPY,
+        our_knn_L2_TORCH,
     ]
     if knn_functions:
         for func in knn_functions:
@@ -3599,9 +3475,9 @@ def tune_batch_size_knn():
         # our_knn_cosine_TORCH,
         # our_knn_dot_TORCH,
         # our_knn_L2_CUDA,
-        our_knn_l2_triton,
-        our_knn_cosine_triton,
-        our_knn_dot_triton,
+        # our_knn_l2_triton,
+        # our_knn_cosine_triton,
+        # our_knn_dot_triton,
         our_knn_l1_triton,
         # our_knn_L2_CUPY_alt,
         # our_knn_L1_CUPY_alt,
@@ -3655,21 +3531,11 @@ def compare_knn_test():
                         (our_knn_l1_cpu,1),
                     ]
     data_configs = [(4000, 1024), (40_000, 1024), (400_000, 1024), (4_000_000, 1024)]
-    # data_configs = [(4000, 1024), (40_000, 1024)]
-    # data_configs = [(4000,1024), (400000,1024), (4_000_000,1024), (15_000_000, 1024)]
 
-    # function_times_df = pd.DataFrame(index=knn_functions, columns=data_configs)
-    # results_df = pd.DataFrame(index=knn_functions, columns=data_configs)
     results = []
 
     
-    
-    # kmeans_functions = [
-    # ann_functions = [our_ann_L2_query_only]
-    # Testing recall
-    # ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
-    # knn_result = our_knn_L2_CUPY(N, D, A, X, K)
-    # print(f"Recall between knn_CUPY and ANN is {recall_rate(knn_result, ann_result):.6f}")
+
  
     if knn_functions:
         for (N, D) in data_configs:
@@ -3710,15 +3576,11 @@ def test_k_means():
     funcs_scaling_pairs = [
         (our_kmeans_L2_CUPY, 0.025),
         (our_kmeans_L2_TORCH, 0.08),
-        # (cuvs_kmeans, 1)
         (our_k_means_L2_cpu,1)
-        # our_kmeans_L2_CUPY_updated_profiled
-        # our_kmeans_L2
+     
     ]
     N_array = [4_000_000, 4_000, 40_000, 400_000]
-    # N_array = [2_000_000]
     D_array = [1024,2]
-    # A = np.random.rand(N, D).astype(np.float32)
     K = 10
     profile = False
     num_streams = 2
@@ -3817,28 +3679,92 @@ def plot_distance_from_csv():
     # results_list, vector_sizes = csv_to_results_list_and_vector_sizes(file_path_2)
     # plot_distance_results(results_list, vector_sizes)
 
+def test_ann():
+    # Configuration
+    vector_counts = [4000000, 4000, 40000, 400000]  # Vector counts to test
+    D = 1024  # Fixed dimensionality
+    K = 10    # Number of nearest neighbors
+    num_clusters_list = [50, 100, 300, 500, 700, 900]  # Different numbers of clusters for ANN
+    repeat = 1  # Number of repetitions for timing consistency
+    scaling_factor = 0.7  # Fraction of GPU memory to use for kNN
+
+    # Initialize results storage
+    results = []
+
+    # Iterate over each vector count
+    for N in vector_counts:
+        print(f"\nTesting with N={N} vectors")
+        
+        # Generate random dataset and query vector
+        A = np.random.randn(N, D).astype(np.float32)
+        X = np.random.randn(D).astype(np.float32)
+
+        # Test across different numbers of clusters
+        for num_clusters in num_clusters_list:
+            print(f"  Number of clusters: {num_clusters}")
+
+            # Perform K-Means clustering once per (N, num_clusters)
+            cluster_assignments, centroids_np = our_kmeans_L2_CUPY(N, D, A, num_clusters)
+            centroids_gpu = cp.asarray(centroids_np)
+
+            # Measure ANN query time (excluding clustering time)
+            ann_times = []
+            for _ in range(repeat):
+                start = time.time()
+                ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
+                cp.cuda.Stream.null.synchronize()  # Ensure GPU computation is complete
+                end = time.time()
+                ann_times.append((end - start) * 1000)  # Convert to milliseconds
+            ann_time_avg = np.mean(ann_times)
+
+            # Measure full kNN search time
+            knn_times = []
+            for _ in range(repeat):
+                start = time.time()
+                knn_result = our_knn_L2_CUPY(N, D, A, X, K, scaling_factor=scaling_factor)
+                cp.cuda.Stream.null.synchronize()  # Ensure GPU computation is complete
+                end = time.time()
+                knn_times.append((end - start) * 1000)  # Convert to milliseconds
+            knn_time_avg = np.mean(knn_times)
+
+            # Compute recall rate between ANN and kNN results
+            recall = recall_rate(knn_result, ann_result)
+
+            # Store results
+            results.append({
+                'Vector Count': N,
+                'Clusters': num_clusters,
+                'ANN Query Time (ms)': ann_time_avg,
+                'KNN Search Time (ms)': knn_time_avg,
+                'Recall': recall
+            })
+
+            # Clear GPU memory to prevent overflow with large datasets
+            cp.get_default_memory_pool().free_all_blocks()
+
+    # Convert results to a DataFrame
+    df = pd.DataFrame(results)
+
+    # Save results to a CSV file with a timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = f"ann_vs_knn_comparison.csv"
+    df.to_csv(save_path, index=False)
+    print(f"\nResults saved to {save_path}")
+
+    # Display the table
+    print("\nComparison Table:")
+    print(df.to_string(index=False))
+
+    return df
+
 
 
 if __name__ == "__main__":
-    # compare_knn_test()
+    #INSTRUCTIONS: Uncomment the function you want to run
     # plot_knn_graph()
     # test_k_means()
-    compute_kmeans_speedup_filtered('results/2025-04-14_09-27-47_with_cpu_kmeans_results.csv')
-    # test_distance()
-    # plot_distance_from_csv()
-    
-    # plot_kmeans_timings('with_cpu_kmeans_results.csv', show_speedup=False)
-    # tune_scaling_factor()
-    # test_knn()
-    # tune_batch_size_knn()
+    #test_ann()
+    pass
 
-    
-    # if kmeans_functions:
-    #     for func in kmeans_functions:
-    #         test_kmeans_wrapper(func, N, D, A, K, num_streams, gpu_batch_num, max_iters, repeat)
-            
-    # if ann_functions:
-    #     for func in ann_functions:
-    #         test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
 
         

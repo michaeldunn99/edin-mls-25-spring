@@ -3790,3 +3790,84 @@ if __name__ == "__main__":
     #         test_ann_query_only(func, N, D, A, X, K, repeat, cluster_assignments, centroids_gpu)
 
         
+def test_ann():
+    # Configuration
+    vector_counts = [4000]#, 40000, 400000, 4000000]  # Vector counts to test
+    D = 1024  # Fixed dimensionality
+    K = 10    # Number of nearest neighbors
+    num_clusters_list = [10, 50, 100]  # Different numbers of clusters for ANN
+    repeat = 5  # Number of repetitions for timing consistency
+    scaling_factor = 0.7  # Fraction of GPU memory to use for kNN
+
+    # Initialize results storage
+    results = []
+
+    # Iterate over each vector count
+    for N in vector_counts:
+        print(f"\nTesting with N={N} vectors")
+        
+        # Generate random dataset and query vector
+        A = np.random.randn(N, D).astype(np.float32)
+        X = np.random.randn(D).astype(np.float32)
+
+        # Test across different numbers of clusters
+        for num_clusters in num_clusters_list:
+            print(f"  Number of clusters: {num_clusters}")
+
+            # Perform K-Means clustering once per (N, num_clusters)
+            cluster_assignments, centroids_np = our_kmeans_L2_CUPY(N, D, A, num_clusters)
+            centroids_gpu = cp.asarray(centroids_np)
+
+            # Measure ANN query time (excluding clustering time)
+            ann_times = []
+            for _ in range(repeat):
+                start = time.time()
+                ann_result = our_ann_L2_query_only(N, D, A, X, K, cluster_assignments, centroids_gpu)
+                cp.cuda.Stream.null.synchronize()  # Ensure GPU computation is complete
+                end = time.time()
+                ann_times.append((end - start) * 1000)  # Convert to milliseconds
+            ann_time_avg = np.mean(ann_times)
+
+            # Measure full kNN search time
+            knn_times = []
+            for _ in range(repeat):
+                start = time.time()
+                knn_result = our_knn_L2_CUPY(N, D, A, X, K, scaling_factor=scaling_factor)
+                cp.cuda.Stream.null.synchronize()  # Ensure GPU computation is complete
+                end = time.time()
+                knn_times.append((end - start) * 1000)  # Convert to milliseconds
+            knn_time_avg = np.mean(knn_times)
+
+            # Compute recall rate between ANN and kNN results
+            recall = recall_rate(knn_result, ann_result)
+
+            # Store results
+            results.append({
+                'Vector Count': N,
+                'Clusters': num_clusters,
+                'ANN Query Time (ms)': ann_time_avg,
+                'KNN Search Time (ms)': knn_time_avg,
+                'Recall': recall
+            })
+
+            # Clear GPU memory to prevent overflow with large datasets
+            cp.get_default_memory_pool().free_all_blocks()
+
+    # Convert results to a DataFrame
+    df = pd.DataFrame(results)
+
+    # Save results to a CSV file with a timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = f"results/ann_vs_knn_comparison_{timestamp}.csv"
+    df.to_csv(save_path, index=False)
+    print(f"\nResults saved to {save_path}")
+
+    # Display the table
+    print("\nComparison Table:")
+    print(df.to_string(index=False))
+
+    return df
+
+# Execute the test
+if __name__ == "__main__":
+    test_ann()

@@ -3792,11 +3792,11 @@ if __name__ == "__main__":
         
 def test_ann():
     # Configuration
-    vector_counts = [4000]#, 40000, 400000, 4000000]  # Vector counts to test
+    vector_counts = [4000, 40000, 400000, 4000000]  # Vector counts to test
     D = 1024  # Fixed dimensionality
     K = 10    # Number of nearest neighbors
-    num_clusters_list = [10, 50, 100]  # Different numbers of clusters for ANN
-    repeat = 5  # Number of repetitions for timing consistency
+    num_clusters_list = [50, 100, 300, 500, 700, 900]  # Different numbers of clusters for ANN
+    repeat = 1  # Number of repetitions for timing consistency
     scaling_factor = 0.7  # Fraction of GPU memory to use for kNN
 
     # Initialize results storage
@@ -3858,7 +3858,7 @@ def test_ann():
 
     # Save results to a CSV file with a timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = f"results/ann_vs_knn_comparison_{timestamp}.csv"
+    save_path = f"ann_vs_knn_comparison.csv"
     df.to_csv(save_path, index=False)
     print(f"\nResults saved to {save_path}")
 
